@@ -1011,18 +1011,21 @@ func (p *Platform) dispatchCoreMessage(msg *core.Message) {
 		return
 	}
 
-	// Thread strategy: send ack FIRST to create the thread, then recompute
-	// session key with the real thread_id from the API response.
-	if p.shouldSendAck(msg) && p.sessionKeyStrategy == "thread" {
+	// Thread-style strategies send ack FIRST to create the thread, then
+	// dispatch with the real thread_id as the session boundary.
+	if p.shouldSendAck(msg) && p.usesThreadSessionStrategy() {
 		if rc, ok := msg.ReplyCtx.(replyContext); ok {
 			realThreadID := p.sendAckAndGetThreadID(context.Background(), msg.Content, rc)
 			if realThreadID != "" {
 				oldKey := msg.SessionKey
-				parts := strings.SplitN(oldKey, ":", 4)
-				if len(parts) == 3 {
-					chatID := parts[1]
-					newKey := fmt.Sprintf("%s:%s:thread:%s", p.platformName, chatID, realThreadID)
+				if chatID, ok := chatIDFromSessionKey(oldKey); ok {
+					newKey := fmt.Sprintf("%s:%s:thread:%s", p.tag(), chatID, realThreadID)
 					msg.SessionKey = newKey
+					rc.sessionKey = newKey
+					rc.threadID = realThreadID
+					rc.replyInThread = true
+					msg.ReplyCtx = rc
+					p.ackThrottle.Store(newKey, time.Now())
 					slog.Debug(p.tag()+": session key updated with real thread_id",
 						"old", oldKey, "new", newKey)
 				}
@@ -1087,11 +1090,14 @@ func (p *Platform) sendAckAndGetThreadID(ctx context.Context, content string, rc
 		return ""
 	}
 	ackText := p.buildAckText(content)
-	realThreadID, err := p.replyMessage(ctx, rctx, "text", ackText)
+	ackTextWithKey := fmt.Sprintf("%s\n[session: %s]", ackText, rctx.sessionKey)
+	msgType, msgBody := buildReplyContent(ackTextWithKey)
+	realThreadID, err := p.replyMessage(ctx, rctx, msgType, msgBody)
 	if err != nil {
 		slog.Debug(p.tag()+": send ack failed", "error", err)
 		return ""
 	}
+	p.ackThrottle.Store(rctx.sessionKey, time.Now())
 	return realThreadID
 }
 
@@ -3095,6 +3101,12 @@ func (p *Platform) makeSessionKey(msg *larkim.EventMessage, chatID, userID strin
 				if threadID := messageThreadIdentity(msg); threadID != "" {
 					return fmt.Sprintf("%s:%s:thread:%s", p.tag(), chatID, threadID)
 				}
+				// Group chat with no thread yet: use msg_id as a temporary
+				// thread key. dispatchCoreMessage will send the ack first and
+				// replace it with the real thread_id before handing off to core.
+				if messageID := stringValue(msg.MessageId); messageID != "" {
+					return fmt.Sprintf("%s:%s:thread:%s", p.tag(), chatID, messageID)
+				}
 			}
 			return fmt.Sprintf("%s:%s:user:%s", p.tag(), chatID, userID)
 
@@ -3135,6 +3147,10 @@ func (p *Platform) makeSessionKey(msg *larkim.EventMessage, chatID, userID strin
 	return fmt.Sprintf("%s:%s:%s", p.tag(), chatID, userID)
 }
 
+func (p *Platform) usesThreadSessionStrategy() bool {
+	return p.sessionKeyStrategy == "hybrid" || p.sessionKeyStrategy == "thread"
+}
+
 func messageThreadIdentity(msg *larkim.EventMessage) string {
 	if msg == nil {
 		return ""
@@ -3148,6 +3164,14 @@ func messageThreadIdentity(msg *larkim.EventMessage) string {
 	// Do NOT fallback to MessageId — it's unique per message and would
 	// create different session keys for messages in the same thread.
 	return ""
+}
+
+func chatIDFromSessionKey(sessionKey string) (string, bool) {
+	parts := strings.Split(sessionKey, ":")
+	if len(parts) < 3 || parts[1] == "" {
+		return "", false
+	}
+	return parts[1], true
 }
 
 func (p *Platform) makeReplyContext(msg *larkim.EventMessage, messageID, chatID, sessionKey string) replyContext {
