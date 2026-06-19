@@ -1324,12 +1324,13 @@ func (p *Platform) dispatchMessage(ctx context.Context, msgType, content string,
 	chatName := p.resolveChatName(chatID)
 
 	// If this message is a reply to another message, fetch the quoted content
-	// and prepend it so the agent has full context.
-	// Skip quote injection when thread_isolation is enabled and the message is
-	// inside a thread — the thread already provides conversational context, and
-	// long quoted prefixes can drown out the user's actual text (issue #764).
+	// and prepend it so the agent has full context. In legacy thread isolation,
+	// non-mentioned thread follow-ups skip quote injection because the thread
+	// already provides context and long quotes can drown out the user's text
+	// (issue #764). Explicit @bot replies always fetch the quote.
 	var quoted quotedMessage
-	if parentID != "" && !(p.threadIsolation && isThreadSessionKey(sessionKey)) {
+	mentionedBot := isBotMentioned(mentions, p.getBotOpenID())
+	if parentID != "" && (mentionedBot || !(p.threadIsolation && isThreadSessionKey(sessionKey))) {
 		quoted = p.fetchQuotedMessage(ctx, parentID)
 	}
 
