@@ -1350,8 +1350,7 @@ func (p *Platform) dispatchMessage(ctx context.Context, msgType, content string,
 	// already provides context and long quotes can drown out the user's text
 	// (issue #764). Explicit @bot replies always fetch the quote.
 	var quoted quotedMessage
-	mentionedBot := isBotMentioned(mentions, p.getBotOpenID())
-	if parentID != "" && (mentionedBot || !(p.threadIsolation && isThreadSessionKey(sessionKey))) {
+	if parentID != "" && !isThreadSessionKey(sessionKey) {
 		quoted = p.fetchQuotedMessage(ctx, parentID)
 	}
 
