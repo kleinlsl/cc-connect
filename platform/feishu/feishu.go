@@ -168,11 +168,20 @@ type Platform struct {
 	// stale entries can be expired by a future TTL sweep if needed.
 	activeThreadSessions sync.Map // sessionKey -> time.Time
 
+	// Session key strategy: "user" (default), "thread", or "chat"
+	// - "user": sessionKey = platform:chatID:userID (same user, same session)
+	// - "thread": sessionKey = platform:chatID:threadID (same thread, same session)
+	// - "chat": sessionKey = platform:chatID (entire chat shares one session)
+	sessionKeyStrategy string
+
 	richCardImageMu         sync.Mutex
 	richCardImageResolved   map[string]string
 	richCardImagePending    map[string]*richCardImageUpload
 	richCardImageFailed     map[string]struct{}
 	richCardImageUploadFunc func(context.Context, string) (string, error)
+
+	// ackThrottle tracks the last ack send time per session to avoid spam
+	ackThrottle sync.Map // sessionKey -> time.Time
 }
 
 type interactivePlatform struct {
@@ -238,6 +247,17 @@ func newPlatform(name, domain string, opts map[string]any) (core.Platform, error
 		noReplyToTrigger = true
 	}
 
+	// Session key strategy: "user" (default), "thread", or "chat"
+	sessionKeyStrategy := "user"
+	if v, ok := opts["session_key_strategy"].(string); ok {
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "user", "thread", "chat":
+			sessionKeyStrategy = strings.ToLower(strings.TrimSpace(v))
+		default:
+			return nil, fmt.Errorf("%s: invalid session_key_strategy %q (want user, thread, or chat)", name, v)
+		}
+	}
+
 	peerBots := map[string]string{}
 	if raw, ok := opts["peer_bots"].(map[string]any); ok {
 		for k, v := range raw {
@@ -297,6 +317,7 @@ func newPlatform(name, domain string, opts map[string]any) (core.Platform, error
 		threadIsolation:            threadIsolation,
 		resolveMentions:            resolveMentionsOpt,
 		noReplyToTrigger:           noReplyToTrigger,
+		sessionKeyStrategy:         sessionKeyStrategy,
 		client:                     lark.NewClient(appID, appSecret, clientOpts...),
 		replayClient:               newFeishuReplayClient(appID, appSecret, domain),
 		dedup:                      &core.MessageDedup{},
@@ -987,7 +1008,71 @@ func (p *Platform) dispatchCoreMessage(msg *core.Message) {
 		slog.Debug(p.tag()+": recalled message dispatch dropped", "message_id", msg.MessageID)
 		return
 	}
+
+	// Send ack message if appropriate
+	if p.shouldSendAck(msg) {
+		p.sendAckMessage(msg)
+	}
+
 	h(p.dispatchPlatform(), msg)
+}
+
+// shouldSendAck determines if an ack message should be sent for this message
+func (p *Platform) shouldSendAck(msg *core.Message) bool {
+	// Don't ack bot's own messages
+	if msg.FromVoice {
+		return false
+	}
+
+	// Don't ack permission responses
+	if msg.IsPermissionResponse {
+		return false
+	}
+
+	// Don't ack recalled messages
+	if msg.Recalled {
+		return false
+	}
+
+	// Check throttle: 30 seconds per session
+	sessionKey := msg.SessionKey
+	if lastAck, ok := p.ackThrottle.Load(sessionKey); ok {
+		if time.Since(lastAck.(time.Time)) < 30*time.Second {
+			return false
+		}
+	}
+
+	// Don't ack very short messages (ack only for substantive messages)
+	content := strings.TrimSpace(msg.Content)
+	if len(content) < 3 {
+		return false
+	}
+
+	return true
+}
+
+// sendAckMessage sends the ack message and records throttle timestamp
+func (p *Platform) sendAckMessage(msg *core.Message) {
+	// Determine ack text based on content
+	ackText := "收到，正在处理中..."
+	content := strings.TrimSpace(msg.Content)
+
+	// Detect alert patterns
+	if strings.Contains(content, "报警") || strings.Contains(content, "告警") || strings.Contains(content, "alert") {
+		ackText = "收到报警，正在排查中..."
+	} else if strings.Contains(content, "订单") || strings.Contains(content, "order") {
+		ackText = "收到，正在查询中..."
+	}
+
+	// Send ack via the platform
+	if err := p.Send(context.Background(), msg.ReplyCtx, ackText); err != nil {
+		slog.Debug(p.tag()+": send ack failed", "error", err, "session_key", msg.SessionKey)
+		return
+	}
+
+	// Record throttle timestamp
+	p.ackThrottle.Store(msg.SessionKey, time.Now())
+	slog.Debug(p.tag()+": ack sent", "session_key", msg.SessionKey, "text", ackText)
 }
 
 func (p *Platform) onMessageRecalled(_ context.Context, event *larkim.P2MessageRecalledV1) error {
@@ -1105,6 +1190,11 @@ func (p *Platform) onMessage(ctx context.Context, event *larkim.P2MessageReceive
 			case p.threadIsolation && isAttachmentMsgType(msgType) && p.isActiveThreadSession(sessionKey):
 				slog.Debug(p.tag()+": passing attachment through active thread without mention",
 					"chat_id", chatID, "session_key", sessionKey, "msg_type", msgType, "message_id", messageID)
+			// Allow interactive (card) messages through without @bot mention
+			// Card messages are typically alerts/notifications that should be processed
+			case msgType == "interactive":
+				slog.Debug(p.tag()+": passing interactive card message without mention",
+					"chat_id", chatID, "msg_type", msgType, "message_id", messageID)
 			default:
 				slog.Debug(p.tag()+": ignoring group message without bot mention", "chat_id", chatID)
 				return nil
@@ -1407,6 +1497,24 @@ func (p *Platform) dispatchMessage(ctx context.Context, msgType, content string,
 			MessageID: messageID,
 			UserID:    userID, UserName: userName, ChatName: chatName,
 			Content: text, ExtraContent: quoted.text, Images: images, ReplyCtx: rctx,
+			UserMessageTimeMs: createTimeMs,
+		})
+
+	case "interactive":
+		text := extractInteractiveCardText(content)
+		if text == "" || text == "[interactive card]" {
+			text = "[卡片消息]"
+		}
+		slog.Debug(p.tag()+": extracted card text",
+			"message_id", messageID,
+			"text_len", len(text),
+			"text_preview", text[:min(100, len(text))],
+		)
+		p.dispatchCoreMessage(&core.Message{
+			SessionKey: sessionKey, Platform: p.platformName,
+			MessageID: messageID,
+			UserID:    userID, UserName: userName, ChatName: chatName,
+			Content: text, ExtraContent: quoted.text, ReplyCtx: rctx,
 			UserMessageTimeMs: createTimeMs,
 		})
 
@@ -1912,208 +2020,71 @@ func extractPostPlainText(content string) string {
 }
 
 // extractInteractiveCardText extracts readable text from a Feishu interactive card JSON.
-// With raw_card_content, the response wraps the card in {"json_card": "...", ...}.
-// Supports schema 2.0 (body.property.elements with recursive nesting) and
-// legacy format (top-level title + elements).
+// Strategy: unescape nested JSON strings if present (json_card / user_dsl),
+// then recursively walk all map/list values collecting string content
+// from content/text/title/plain_text keys.
 func extractInteractiveCardText(content string) string {
-	// Try raw_card_content format: {"json_card": "<escaped JSON>", ...}
 	var wrapper struct {
 		JsonCard string `json:"json_card"`
+		UserDSL  string `json:"user_dsl"`
 	}
 	cardJSON := content
-	if json.Unmarshal([]byte(content), &wrapper) == nil && wrapper.JsonCard != "" {
-		cardJSON = wrapper.JsonCard
+	if json.Unmarshal([]byte(content), &wrapper) == nil {
+		if wrapper.JsonCard != "" {
+			cardJSON = wrapper.JsonCard
+		} else if wrapper.UserDSL != "" {
+			cardJSON = wrapper.UserDSL
+		}
 	}
 
-	var card map[string]json.RawMessage
-	if err := json.Unmarshal([]byte(cardJSON), &card); err != nil {
+	var v any
+	if err := json.Unmarshal([]byte(cardJSON), &v); err != nil {
 		return "[interactive card]"
 	}
 
 	var parts []string
-
-	// Schema 2.0: body may use property.elements (standard) or direct elements (simplified).
-	if raw, ok := card["body"]; ok {
-		var body struct {
-			Tag      string            `json:"tag"`
-			Elements []json.RawMessage `json:"elements"`
-			Property struct {
-				Elements []json.RawMessage `json:"elements"`
-			} `json:"property"`
-		}
-		if json.Unmarshal(raw, &body) == nil {
-			if body.Tag == "body" && len(body.Property.Elements) > 0 {
-				extractCardElements(body.Property.Elements, &parts)
-			} else if len(body.Elements) > 0 {
-				extractCardElements(body.Elements, &parts)
-			}
-		}
-	}
-
-	// Legacy: direct title string + flat/nested elements.
-	if len(parts) == 0 {
-		if raw, ok := card["header"]; ok {
-			var header struct {
-				Title struct {
-					Content string `json:"content"`
-				} `json:"title"`
-			}
-			if json.Unmarshal(raw, &header) == nil && header.Title.Content != "" {
-				parts = append(parts, header.Title.Content)
-			}
-		}
-		if len(parts) == 0 {
-			if raw, ok := card["title"]; ok {
-				var title string
-				if json.Unmarshal(raw, &title) == nil && title != "" {
-					parts = append(parts, title)
-				}
-			}
-		}
-		var elements []json.RawMessage
-		if raw, ok := card["elements"]; ok {
-			var nested [][]json.RawMessage
-			if json.Unmarshal(raw, &nested) == nil && len(nested) > 0 {
-				for _, row := range nested {
-					elements = append(elements, row...)
-				}
-			} else {
-				_ = json.Unmarshal(raw, &elements)
-			}
-		}
-		for _, raw := range elements {
-			var elem struct {
-				Tag  string `json:"tag"`
-				Text string `json:"text"`
-			}
-			if json.Unmarshal(raw, &elem) == nil && elem.Tag == "text" && strings.TrimSpace(elem.Text) != "" {
-				parts = append(parts, elem.Text)
-			}
-		}
-	}
+	walkCardValue(v, &parts)
 
 	if len(parts) == 0 {
 		return "[interactive card]"
 	}
-	return strings.Join(parts, "\n")
+	return strings.Join(dedupeStrings(parts), "\n")
 }
 
-// extractCardElements recursively extracts text from schema 2.0 card elements.
-// Handles: property.content, property.text (nested element), property.elements (recursive),
-// code_span, code_block (with tokenized contents), text_tag, hr, button (with open_url), etc.
-func extractCardElements(elements []json.RawMessage, parts *[]string) {
-	for _, raw := range elements {
-		var elem struct {
-			Tag      string `json:"tag"`
-			Content  string `json:"content"`
-			Property struct {
-				Content   string            `json:"content"`
-				Contents  json.RawMessage   `json:"contents"`
-				Language  string            `json:"language"`
-				Elements  []json.RawMessage `json:"elements"`
-				Text      json.RawMessage   `json:"text"`
-				Items     json.RawMessage   `json:"items"`
-				Columns   json.RawMessage   `json:"columns"`
-				Rows      json.RawMessage   `json:"rows"`
-				Behaviors json.RawMessage   `json:"behaviors"`
-			} `json:"property"`
+// walkCardValue recursively walks any JSON value and collects
+// string values from content/text/title/plain_text keys.
+func walkCardValue(v any, parts *[]string) {
+	switch x := v.(type) {
+	case map[string]any:
+		for k, val := range x {
+			lk := strings.ToLower(k)
+			switch lk {
+			case "content", "text", "title", "plain_text":
+				if s, ok := val.(string); ok && strings.TrimSpace(s) != "" {
+					*parts = append(*parts, strings.TrimSpace(s))
+				}
+			}
+			walkCardValue(val, parts)
 		}
-		if json.Unmarshal(raw, &elem) != nil {
-			continue
-		}
-		switch elem.Tag {
-		case "button":
-			// Extract button label text and open_url from behaviors.
-			label := elem.Property.Content
-			if label == "" {
-				// label may be in property.text.property.content
-				var textElem struct {
-					Property struct {
-						Content string `json:"content"`
-					} `json:"property"`
-				}
-				if json.Unmarshal(elem.Property.Text, &textElem) == nil {
-					label = textElem.Property.Content
-				}
-			}
-			var openURL string
-			if len(elem.Property.Behaviors) > 0 {
-				var behaviors []struct {
-					Type string `json:"type"`
-					URL  string `json:"url"`
-				}
-				if json.Unmarshal(elem.Property.Behaviors, &behaviors) == nil {
-					for _, b := range behaviors {
-						if b.Type == "open_url" && b.URL != "" {
-							openURL = b.URL
-							break
-						}
-					}
-				}
-			}
-			if label != "" && openURL != "" {
-				*parts = append(*parts, fmt.Sprintf("[%s](%s)", label, openURL))
-			} else if label != "" {
-				*parts = append(*parts, label)
-			}
-		case "code_block":
-			var lines []struct {
-				Contents []struct {
-					Content string `json:"content"`
-				} `json:"contents"`
-			}
-			if json.Unmarshal(elem.Property.Contents, &lines) == nil {
-				var codeLines []string
-				for _, line := range lines {
-					var lineText string
-					for _, tok := range line.Contents {
-						lineText += tok.Content
-					}
-					codeLines = append(codeLines, lineText)
-				}
-				code := strings.Join(codeLines, "")
-				if strings.TrimSpace(code) != "" {
-					lang := elem.Property.Language
-					if lang != "" {
-						*parts = append(*parts, fmt.Sprintf("```%s\n%s```", lang, code))
-					} else {
-						*parts = append(*parts, fmt.Sprintf("```\n%s```", code))
-					}
-				}
-			}
-		case "code_span":
-			if elem.Property.Content != "" {
-				*parts = append(*parts, "`"+elem.Property.Content+"`")
-			}
-		case "hr":
-			*parts = append(*parts, "---")
-		case "table":
-			extractCardTable(elem.Property.Columns, elem.Property.Rows, parts)
-		case "list":
-			extractCardListItems(elem.Property.Items, parts)
-		default:
-			content := elem.Property.Content
-			if content == "" {
-				content = elem.Content
-			}
-			if content != "" {
-				*parts = append(*parts, content)
-			}
-			if len(elem.Property.Text) > 0 {
-				var textElem struct {
-					Property struct {
-						Content string `json:"content"`
-					} `json:"property"`
-				}
-				if json.Unmarshal(elem.Property.Text, &textElem) == nil && textElem.Property.Content != "" {
-					*parts = append(*parts, textElem.Property.Content)
-				}
-			}
-		}
-		if len(elem.Property.Elements) > 0 {
-			extractCardElements(elem.Property.Elements, parts)
+	case []any:
+		for _, item := range x {
+			walkCardValue(item, parts)
 		}
 	}
+}
+
+// dedupeStrings removes adjacent duplicates from a string slice.
+func dedupeStrings(s []string) []string {
+	if len(s) < 2 {
+		return s
+	}
+	r := make([]string, 0, len(s))
+	for i, v := range s {
+		if i == 0 || v != s[i-1] {
+			r = append(r, v)
+		}
+	}
+	return r
 }
 
 // extractCardTable extracts text from a Feishu card table element.
@@ -2121,61 +2092,63 @@ func extractCardElements(elements []json.RawMessage, parts *[]string) {
 // property.rows is an array of row objects where each key is the column name
 // and the value has a "data" field containing a markdown/plain_text element.
 func extractCardTable(columnsRaw, rowsRaw json.RawMessage, parts *[]string) {
-	var columns []struct {
-		DisplayName string `json:"displayName"`
-		Name        string `json:"name"`
-	}
-	if err := json.Unmarshal(columnsRaw, &columns); err != nil || len(columns) == 0 {
-		return
-	}
-	var rows []map[string]struct {
-		Data json.RawMessage `json:"data"`
-	}
-	if err := json.Unmarshal(rowsRaw, &rows); err != nil {
-		return
-	}
+		var columns []struct {
+			DisplayName string `json:"displayName"`
+			Name        string `json:"name"`
+		}
+		if err := json.Unmarshal(columnsRaw, &columns); err != nil || len(columns) == 0 {
+			return
+		}
+		var rows []map[string]struct {
+			Data json.RawMessage `json:"data"`
+		}
+		if err := json.Unmarshal(rowsRaw, &rows); err != nil {
+			return
+		}
 
-	// Build markdown table.
-	header := make([]string, len(columns))
-	for i, col := range columns {
-		header[i] = col.DisplayName
-	}
-	*parts = append(*parts, "| "+strings.Join(header, " | ")+" |")
-	sep := make([]string, len(columns))
-	for i := range sep {
-		sep[i] = "---"
-	}
-	*parts = append(*parts, "| "+strings.Join(sep, " | ")+" |")
-
-	for _, row := range rows {
-		cells := make([]string, len(columns))
+		// Build markdown table.
+		header := make([]string, len(columns))
 		for i, col := range columns {
-			cell := row[col.Name]
-			var cellParts []string
-			extractCardElements([]json.RawMessage{cell.Data}, &cellParts)
-			cells[i] = strings.Join(cellParts, " ")
+			header[i] = col.DisplayName
 		}
-		*parts = append(*parts, "| "+strings.Join(cells, " | ")+" |")
-	}
-}
+		*parts = append(*parts, "| "+strings.Join(header, " | ")+" |")
+		sep := make([]string, len(columns))
+		for i := range sep {
+			sep[i] = "---"
+		}
+		*parts = append(*parts, "| "+strings.Join(sep, " | ")+" |")
 
-// extractCardListItems extracts text from a Feishu card list element.
-// List structure: property.items is an array of items, each with an "elements" array.
-func extractCardListItems(itemsRaw json.RawMessage, parts *[]string) {
-	var items []struct {
-		Elements []json.RawMessage `json:"elements"`
-	}
-	if err := json.Unmarshal(itemsRaw, &items); err != nil {
-		return
-	}
-	for _, item := range items {
-		var itemParts []string
-		extractCardElements(item.Elements, &itemParts)
-		if len(itemParts) > 0 {
-			*parts = append(*parts, "- "+strings.Join(itemParts, " "))
+		for _, row := range rows {
+			cells := make([]string, len(columns))
+			for i, col := range columns {
+				cell := row[col.Name]
+				var cellParts []string
+				walkCardValue(cell.Data, &cellParts)
+				cells[i] = strings.Join(cellParts, " ")
+			}
+			*parts = append(*parts, "| "+strings.Join(cells, " | ")+" |")
 		}
 	}
-}
+
+	// extractCardListItems extracts text from a Feishu card list element.
+	// List structure: property.items is an array of items, each with an "elements" array.
+	func extractCardListItems(itemsRaw json.RawMessage, parts *[]string) {
+		var items []struct {
+			Elements []json.RawMessage `json:"elements"`
+		}
+		if err := json.Unmarshal(itemsRaw, &items); err != nil {
+			return
+		}
+		for _, item := range items {
+			var itemParts []string
+			for _, elem := range item.Elements {
+				walkCardValue(elem, &itemParts)
+			}
+			if len(itemParts) > 0 {
+				*parts = append(*parts, "- "+strings.Join(itemParts, " "))
+			}
+		}
+	}
 
 // parseMergeForward fetches sub-messages of a merge_forward message via the
 // GET /open-apis/im/v1/messages/{message_id} API, then formats them into
@@ -3070,6 +3043,38 @@ func stripMentions(text string, mentions []*larkim.MentionEvent, botOpenID strin
 // TODO: Session-key derivation and reply-thread behavior are split across multiple code paths here.
 // Should revisit thread/root handling without changing thread_isolation=false behavior.
 func (p *Platform) makeSessionKey(msg *larkim.EventMessage, chatID, userID string) string {
+	// Use configured strategy if set
+	if p.sessionKeyStrategy != "" {
+		switch p.sessionKeyStrategy {
+		case "thread":
+			// Thread-level isolation: same thread = same session
+			if msg != nil {
+				threadID := stringValue(msg.ThreadId)
+				if threadID != "" {
+					return fmt.Sprintf("%s:%s:thread:%s", p.tag(), chatID, threadID)
+				}
+				// Fallback to rootID for thread-like behavior
+				rootID := stringValue(msg.RootId)
+				if rootID != "" {
+					return fmt.Sprintf("%s:%s:thread:%s", p.tag(), chatID, rootID)
+				}
+				// Do NOT fallback to msg.MessageId here — it's unique per message
+				// and would create a new session for every message in the thread.
+			}
+			// Fallback to user-level for non-thread messages
+			return fmt.Sprintf("%s:%s:user:%s", p.tag(), chatID, userID)
+
+		case "chat":
+			// Chat-level: entire chat shares one session
+			return fmt.Sprintf("%s:%s", p.tag(), chatID)
+
+		default: // "user"
+			// User-level (default): same user = same session
+			return fmt.Sprintf("%s:%s:user:%s", p.tag(), chatID, userID)
+		}
+	}
+
+	// Legacy behavior: threadIsolation uses rootID
 	if p.threadIsolation && msg != nil && stringValue(msg.ChatType) == "group" {
 		rootID := stringValue(msg.RootId)
 		if rootID == "" {
@@ -3101,6 +3106,11 @@ func (p *Platform) shouldReplyInThread(rc replyContext) bool {
 	if rc.messageID == "" {
 		return false
 	}
+	// Support new sessionKeyStrategy
+	if p.sessionKeyStrategy == "thread" {
+		return isThreadSessionKey(rc.sessionKey)
+	}
+	// Legacy behavior
 	return p.threadIsolation && isThreadSessionKey(rc.sessionKey)
 }
 
@@ -3352,12 +3362,19 @@ func parseThreadRootID(sessionTail string) (string, bool) {
 }
 
 func isThreadSessionKey(sessionKey string) bool {
-	parts := strings.SplitN(sessionKey, ":", 3)
-	if len(parts) != 3 {
-		return false
+	// Support both old format "platform:chatID:root:xxx" and new format "platform:chatID:thread:xxx"
+	parts := strings.SplitN(sessionKey, ":", 4)
+	if len(parts) == 4 {
+		// New format: platform:chatID:thread:threadID or platform:chatID:root:rootID
+		return parts[2] == "thread" || parts[2] == "root"
 	}
-	_, ok := parseThreadRootID(parts[2])
-	return ok
+	if len(parts) == 3 {
+		// Old format: platform:chatID:root:xxx (SplitN with limit 4 would give 4 parts)
+		// This branch handles legacy format without the prefix
+		_, ok := parseThreadRootID(parts[2])
+		return ok
+	}
+	return false
 }
 
 // feishuPreviewHandle stores the message ID for an editable preview message.
