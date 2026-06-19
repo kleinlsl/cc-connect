@@ -1020,7 +1020,7 @@ func (p *Platform) dispatchCoreMessage(msg *core.Message) {
 	// session key with the real thread_id from the API response.
 	if p.shouldSendAck(msg) && p.sessionKeyStrategy == "thread" {
 		if rc, ok := msg.ReplyCtx.(replyContext); ok {
-			realThreadID := p.sendAckAndGetThreadID(context.Background(), msg.Content, rc, msg.MessageID)
+			realThreadID := p.sendAckAndGetThreadID(context.Background(), msg.Content, rc, msg.MessageID, msg.SessionKey)
 			if realThreadID != "" && realThreadID != msg.SessionKey {
 				oldKey := msg.SessionKey
 				parts := strings.SplitN(oldKey, ":", 4)
@@ -1089,12 +1089,13 @@ func (p *Platform) sendAckMessage(msg *core.Message) {
 // sendAckAndGetThreadID sends the ack message and returns the real thread_id
 // from the Feishu API response. Used for thread strategy: send ack first to
 // create the thread, then compute the session key with the real thread_id.
-func (p *Platform) sendAckAndGetThreadID(ctx context.Context, content string, rctx replyContext, msgID string) string {
+func (p *Platform) sendAckAndGetThreadID(ctx context.Context, content string, rctx replyContext, msgID, sessionKey string) string {
 	if !p.shouldSendAckForContent(content) {
 		return ""
 	}
 	ackText := p.buildAckText(content)
-	if err := p.Send(ctx, rctx, ackText); err != nil {
+	ackTextWithKey := fmt.Sprintf("%s\n[session: %s]", ackText, sessionKey)
+	if err := p.Send(ctx, rctx, ackTextWithKey); err != nil {
 		slog.Debug(p.tag()+": send ack failed", "error", err)
 		return ""
 	}
