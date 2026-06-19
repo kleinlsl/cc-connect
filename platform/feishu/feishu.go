@@ -1016,8 +1016,24 @@ func (p *Platform) dispatchCoreMessage(msg *core.Message) {
 		return
 	}
 
-	// Send ack message if appropriate
-	if p.shouldSendAck(msg) {
+	// Thread strategy: send ack FIRST to create the thread, then recompute
+	// session key with the real thread_id from the API response.
+	if p.shouldSendAck(msg) && p.sessionKeyStrategy == "thread" {
+		if rc, ok := msg.ReplyCtx.(replyContext); ok {
+			realThreadID := p.sendAckAndGetThreadID(context.Background(), msg.Content, rc, msg.MessageID)
+			if realThreadID != "" && realThreadID != msg.SessionKey {
+				oldKey := msg.SessionKey
+				parts := strings.SplitN(oldKey, ":", 4)
+				if len(parts) == 3 {
+					chatID := parts[1]
+					newKey := fmt.Sprintf("%s:%s:thread:%s", p.platformName, chatID, realThreadID)
+					msg.SessionKey = newKey
+					slog.Debug(p.tag()+": session key updated with real thread_id",
+						"old", oldKey, "new", newKey, "real_thread_id", realThreadID)
+				}
+			}
+		}
+	} else if p.shouldSendAck(msg) {
 		p.sendAckMessage(msg)
 	}
 
@@ -1060,27 +1076,49 @@ func (p *Platform) shouldSendAck(msg *core.Message) bool {
 
 // sendAckMessage sends the ack message and records throttle timestamp
 func (p *Platform) sendAckMessage(msg *core.Message) {
-	// Determine ack text based on content
-	ackText := "收到，正在处理中..."
-	content := strings.TrimSpace(msg.Content)
-
-	// Detect alert patterns
-	if strings.Contains(content, "报警") || strings.Contains(content, "告警") || strings.Contains(content, "alert") {
-		ackText = "收到报警，正在排查中..."
-	} else if strings.Contains(content, "订单") || strings.Contains(content, "order") {
-		ackText = "收到，正在查询中..."
-	}
-
-	// Send ack via the platform
+	ackText := p.buildAckText(msg.Content)
 	ackTextWithKey := fmt.Sprintf("%s\n[session: %s]", ackText, msg.SessionKey)
 	if err := p.Send(context.Background(), msg.ReplyCtx, ackTextWithKey); err != nil {
 		slog.Debug(p.tag()+": send ack failed", "error", err, "session_key", msg.SessionKey)
 		return
 	}
-
-	// Record throttle timestamp
 	p.ackThrottle.Store(msg.SessionKey, time.Now())
 	slog.Debug(p.tag()+": ack sent", "session_key", msg.SessionKey, "text", ackText)
+}
+
+// sendAckAndGetThreadID sends the ack message and returns the real thread_id
+// from the Feishu API response. Used for thread strategy: send ack first to
+// create the thread, then compute the session key with the real thread_id.
+func (p *Platform) sendAckAndGetThreadID(ctx context.Context, content string, rctx replyContext, msgID string) string {
+	if !p.shouldSendAckForContent(content) {
+		return ""
+	}
+	ackText := p.buildAckText(content)
+	if err := p.Send(ctx, rctx, ackText); err != nil {
+		slog.Debug(p.tag()+": send ack failed", "error", err)
+		return ""
+	}
+	// replyMessage stored the mapping: msgID → realThreadID
+	// Look it up now.
+	return p.resolveRealThreadID(msgID)
+}
+
+// buildAckText determines the ack text based on message content
+func (p *Platform) buildAckText(content string) string {
+	trimmed := strings.TrimSpace(content)
+	if strings.Contains(trimmed, "报警") || strings.Contains(trimmed, "告警") || strings.Contains(trimmed, "alert") {
+		return "收到报警，正在排查中..."
+	}
+	if strings.Contains(trimmed, "订单") || strings.Contains(trimmed, "order") {
+		return "收到，正在查询中..."
+	}
+	return "收到，正在处理中..."
+}
+
+// shouldSendAckForContent checks if an ack should be sent for this content
+func (p *Platform) shouldSendAckForContent(content string) bool {
+	trimmed := strings.TrimSpace(content)
+	return len(trimmed) >= 3
 }
 
 func (p *Platform) onMessageRecalled(_ context.Context, event *larkim.P2MessageRecalledV1) error {
@@ -3210,14 +3248,19 @@ func (p *Platform) replyMessage(ctx context.Context, rc replyContext, msgType, c
 			}
 			// Capture real thread_id from reply response for thread session mapping.
 			// When reply_in_thread creates a new thread, the response contains the
-			// real thread_id. Store bidirectional mapping so:
-			// - tempID → realThreadID (for resolveRealThreadID)
-			// - realThreadID → tempID (for makeSessionKey to find the first message's key)
+			// real thread_id. Store bidirectional mapping using the ORIGINAL message_id
+			// (rc.messageID) as the temp key, since for the first message rc.threadID is empty.
 			if resp.Data != nil && resp.Data.ThreadId != nil && *resp.Data.ThreadId != "" {
 				if rc.threadID != "" && rc.threadID != *resp.Data.ThreadId {
+					// Has a temp thread_id: map temp ↔ real
 					p.pendingThreadSessions.Store(rc.threadID, *resp.Data.ThreadId)
 					p.pendingThreadSessions.Store(*resp.Data.ThreadId, rc.threadID)
 					slog.Debug(p.tag()+": stored thread mapping", "temp", rc.threadID, "real", *resp.Data.ThreadId)
+				} else if rc.threadID == "" && rc.messageID != "" {
+					// No temp thread_id (first message): map msg_id ↔ real
+					p.pendingThreadSessions.Store(rc.messageID, *resp.Data.ThreadId)
+					p.pendingThreadSessions.Store(*resp.Data.ThreadId, rc.messageID)
+					slog.Debug(p.tag()+": stored thread mapping from msg_id", "msg_id", rc.messageID, "real", *resp.Data.ThreadId)
 				}
 			}
 			return nil
