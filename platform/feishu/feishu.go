@@ -1067,7 +1067,8 @@ func (p *Platform) sendAckMessage(msg *core.Message) {
 	}
 
 	// Send ack via the platform
-	if err := p.Send(context.Background(), msg.ReplyCtx, ackText); err != nil {
+	ackTextWithKey := fmt.Sprintf("%s\n[session: %s]", ackText, msg.SessionKey)
+	if err := p.Send(context.Background(), msg.ReplyCtx, ackTextWithKey); err != nil {
 		slog.Debug(p.tag()+": send ack failed", "error", err, "session_key", msg.SessionKey)
 		return
 	}
