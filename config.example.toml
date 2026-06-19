@@ -993,6 +993,8 @@ app_secret = "your-feishu-app-secret"
 #                                   # 设为 true 时，群聊内所有用户共享同一个 Agent 会话
 # thread_isolation = false  # If true, group messages use Feishu reply threads as session boundaries (one thread/root = one agent session)
 #                           # 设为 true 时，群聊按飞书话题/根消息隔离会话（一个 thread/root 对应一个 Agent 会话）
+# session_key_strategy = "hybrid" # Recommended for alert/group workflows: group messages use thread sessions; private chats use user sessions.
+#                                 # 推荐用于群告警/多任务场景：群聊按话题隔离会话，私聊按用户隔离；首次 ack 会以 reply_in_thread=true 触发飞书话题。
 # reply_to_trigger = true   # Default: bot uses “reply to message” API (quotes the user’s message). Set false to post plain chat messages instead.
 #                           # 默认 true：用「回复消息」API（引用用户消息）。设为 false 则在会话里发普通消息、不引用触发消息。
 # progress_style = "legacy" # Progress rendering style: legacy | compact | card

@@ -7,6 +7,8 @@ import (
 	"errors"
 	"log/slog"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"strings"
 	"sync"
@@ -115,6 +117,33 @@ func TestNew_ProgressStyleRejectsInvalidValue(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "invalid progress_style") {
 		t.Fatalf("error = %q, want invalid progress_style", err.Error())
+	}
+}
+
+func TestNew_DefaultSessionKeyStrategyPreservesLegacyBehavior(t *testing.T) {
+	pAny, err := New(map[string]any{"app_id": "cli_xxx", "app_secret": "secret", "enable_feishu_card": false})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	p := pAny.(*Platform)
+	if p.sessionKeyStrategy != "" {
+		t.Fatalf("sessionKeyStrategy = %q, want empty legacy strategy", p.sessionKeyStrategy)
+	}
+}
+
+func TestNew_SupportsHybridSessionKeyStrategy(t *testing.T) {
+	pAny, err := New(map[string]any{
+		"app_id":               "cli_xxx",
+		"app_secret":           "secret",
+		"enable_feishu_card":   false,
+		"session_key_strategy": "hybrid",
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	p := pAny.(*Platform)
+	if p.sessionKeyStrategy != "hybrid" {
+		t.Fatalf("sessionKeyStrategy = %q, want hybrid", p.sessionKeyStrategy)
 	}
 }
 
@@ -827,6 +856,137 @@ func TestLark_GroupReplyAllWithThreadIsolationUsesRootSessionKeyWithoutMention(t
 	}
 }
 
+func TestFeishu_HybridGroupStartUsesMessageThreadSessionAndThreadAck(t *testing.T) {
+	const appID = "cli_hybrid_ack"
+	const appSecret = "secret-hybrid-ack"
+
+	var replyBodies []map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/open-apis/auth/v3/tenant_access_token/internal":
+			writeJSON(t, w, map[string]any{
+				"code":                0,
+				"msg":                 "success",
+				"expire":              7200,
+				"tenant_access_token": "tenant-token",
+			})
+		case r.URL.Path == "/open-apis/im/v1/messages/om_start/reply":
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode reply body: %v", err)
+			}
+			replyBodies = append(replyBodies, body)
+			writeJSON(t, w, map[string]any{
+				"code": 0,
+				"msg":  "success",
+				"data": map[string]any{"message_id": "om_ack"},
+			})
+		case strings.HasPrefix(r.URL.Path, "/open-apis/contact/v3/users/"):
+			writeJSON(t, w, map[string]any{"code": 0, "msg": "success"})
+		case strings.HasPrefix(r.URL.Path, "/open-apis/im/v1/chats/"):
+			writeJSON(t, w, map[string]any{"code": 0, "msg": "success"})
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	p := &Platform{
+		platformName:       "feishu",
+		domain:             srv.URL,
+		appID:              appID,
+		appSecret:          appSecret,
+		sessionKeyStrategy: "hybrid",
+		client: lark.NewClient(appID, appSecret,
+			lark.WithOpenBaseUrl(srv.URL),
+			lark.WithHttpClient(srv.Client()),
+		),
+		replayClient: lark.NewClient(appID, appSecret,
+			lark.WithEnableTokenCache(false),
+			lark.WithOpenBaseUrl(srv.URL),
+			lark.WithHttpClient(srv.Client()),
+		),
+	}
+
+	msgCh := make(chan *core.Message, 1)
+	p.handler = func(_ core.Platform, msg *core.Message) {
+		msgCh <- msg
+	}
+
+	chatID := "oc_alerts"
+	userID := "ou_user"
+	msgType := "text"
+	chatType := "group"
+	senderType := "user"
+	content := `{"text":"@bot 查一下报警"}`
+	createText := strconv.FormatInt(time.Now().UnixMilli(), 10)
+	if err := p.onMessage(context.Background(), &larkim.P2MessageReceiveV1{
+		Event: &larkim.P2MessageReceiveV1Data{
+			Sender: &larkim.EventSender{
+				SenderId:   &larkim.UserId{OpenId: &userID},
+				SenderType: &senderType,
+			},
+			Message: &larkim.EventMessage{
+				MessageId:   stringPtr("om_start"),
+				ChatId:      &chatID,
+				ChatType:    &chatType,
+				MessageType: &msgType,
+				Content:     &content,
+				CreateTime:  &createText,
+			},
+		},
+	}); err != nil {
+		t.Fatalf("onMessage() error = %v", err)
+	}
+
+	select {
+	case msg := <-msgCh:
+		if msg.SessionKey != "feishu:oc_alerts:thread:om_start" {
+			t.Fatalf("SessionKey = %q, want feishu:oc_alerts:thread:om_start", msg.SessionKey)
+		}
+		rc, ok := msg.ReplyCtx.(replyContext)
+		if !ok {
+			t.Fatalf("ReplyCtx type = %T, want replyContext", msg.ReplyCtx)
+		}
+		if !rc.replyInThread {
+			t.Fatal("replyContext.replyInThread = false, want true")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for hybrid group message")
+	}
+
+	if len(replyBodies) != 1 {
+		t.Fatalf("reply calls = %d, want 1 ack reply", len(replyBodies))
+	}
+	if got, _ := replyBodies[0]["reply_in_thread"].(bool); !got {
+		t.Fatalf("reply_in_thread = %v, want true in ack reply body", replyBodies[0]["reply_in_thread"])
+	}
+}
+
+func TestFeishu_HybridThreadMessageUsesThreadIDSession(t *testing.T) {
+	p := &Platform{platformName: "feishu", sessionKeyStrategy: "hybrid"}
+	chatType := "group"
+	msg := &larkim.EventMessage{
+		ChatType: &chatType,
+		ThreadId: stringPtr("omt_thread"),
+		RootId:   stringPtr("om_root"),
+	}
+
+	sessionKey := p.makeSessionKey(msg, "oc_alerts", "ou_user")
+	if sessionKey != "feishu:oc_alerts:thread:omt_thread" {
+		t.Fatalf("sessionKey = %q, want feishu:oc_alerts:thread:omt_thread", sessionKey)
+	}
+
+	rc := p.makeReplyContext(msg, "om_child", "oc_alerts", sessionKey)
+	if !rc.replyInThread {
+		t.Fatal("replyContext.replyInThread = false, want true")
+	}
+	if rc.threadID != "omt_thread" {
+		t.Fatalf("replyContext.threadID = %q, want omt_thread", rc.threadID)
+	}
+}
+
 func TestBuildReplyMessageReqBody_SetsReplyInThreadFlag(t *testing.T) {
 	tests := []struct {
 		name          string
@@ -851,6 +1011,12 @@ func TestBuildReplyMessageReqBody_SetsReplyInThreadFlag(t *testing.T) {
 			platform:      &Platform{},
 			replyCtx:      replyContext{messageID: "om_reply"},
 			wantThreading: false,
+		},
+		{
+			name:          "explicit reply context routes into thread",
+			platform:      &Platform{},
+			replyCtx:      replyContext{messageID: "om_reply", sessionKey: "feishu:oc_chat:thread:om_root", replyInThread: true},
+			wantThreading: true,
 		},
 	}
 

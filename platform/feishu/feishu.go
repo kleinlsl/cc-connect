@@ -107,9 +107,11 @@ func init() {
 }
 
 type replyContext struct {
-	messageID  string
-	chatID     string
-	sessionKey string
+	messageID     string
+	chatID        string
+	sessionKey    string
+	threadID      string
+	replyInThread bool
 }
 
 type Platform struct {
@@ -168,10 +170,8 @@ type Platform struct {
 	// stale entries can be expired by a future TTL sweep if needed.
 	activeThreadSessions sync.Map // sessionKey -> time.Time
 
-	// Session key strategy: "user" (default), "thread", or "chat"
-	// - "user": sessionKey = platform:chatID:userID (same user, same session)
-	// - "thread": sessionKey = platform:chatID:threadID (same thread, same session)
-	// - "chat": sessionKey = platform:chatID (entire chat shares one session)
+	// Session key strategy: empty uses legacy thread_isolation/share_session_in_channel behavior.
+	// Explicit values: "hybrid" (group thread, p2p user), "user", "thread", or "chat".
 	sessionKeyStrategy string
 
 	richCardImageMu         sync.Mutex
@@ -247,14 +247,16 @@ func newPlatform(name, domain string, opts map[string]any) (core.Platform, error
 		noReplyToTrigger = true
 	}
 
-	// Session key strategy: "user" (default), "thread", or "chat"
-	sessionKeyStrategy := "user"
+	// Empty preserves legacy thread_isolation/share_session_in_channel behavior.
+	sessionKeyStrategy := ""
 	if v, ok := opts["session_key_strategy"].(string); ok {
 		switch strings.ToLower(strings.TrimSpace(v)) {
-		case "user", "thread", "chat":
+		case "", "legacy":
+			sessionKeyStrategy = ""
+		case "hybrid", "user", "thread", "chat":
 			sessionKeyStrategy = strings.ToLower(strings.TrimSpace(v))
 		default:
-			return nil, fmt.Errorf("%s: invalid session_key_strategy %q (want user, thread, or chat)", name, v)
+			return nil, fmt.Errorf("%s: invalid session_key_strategy %q (want legacy, hybrid, user, thread, or chat)", name, v)
 		}
 	}
 
@@ -1127,6 +1129,10 @@ func (p *Platform) onMessage(ctx context.Context, event *larkim.P2MessageReceive
 	userID := userIDFromEvent(sender.SenderId)
 	// userName and chatName are resolved in dispatchMessage to avoid blocking
 	// the SDK dispatcher goroutine with synchronous HTTP calls.
+	if botOpenID := p.getBotOpenID(); botOpenID != "" && userID == botOpenID {
+		slog.Debug(p.tag()+": ignoring bot's own message", "user", userID)
+		return nil
+	}
 
 	messageID := ""
 	if msg.MessageId != nil {
@@ -1230,7 +1236,7 @@ func (p *Platform) onMessage(ctx context.Context, event *larkim.P2MessageReceive
 	mentions := msg.Mentions
 	parentID := stringValue(msg.ParentId)
 
-	rctx := replyContext{messageID: messageID, chatID: chatID, sessionKey: sessionKey}
+	rctx := p.makeReplyContext(msg, messageID, chatID, sessionKey)
 	slog.Debug(p.tag()+": routed inbound message",
 		"message_id", messageID,
 		"session_key", sessionKey,
@@ -2092,63 +2098,63 @@ func dedupeStrings(s []string) []string {
 // property.rows is an array of row objects where each key is the column name
 // and the value has a "data" field containing a markdown/plain_text element.
 func extractCardTable(columnsRaw, rowsRaw json.RawMessage, parts *[]string) {
-		var columns []struct {
-			DisplayName string `json:"displayName"`
-			Name        string `json:"name"`
-		}
-		if err := json.Unmarshal(columnsRaw, &columns); err != nil || len(columns) == 0 {
-			return
-		}
-		var rows []map[string]struct {
-			Data json.RawMessage `json:"data"`
-		}
-		if err := json.Unmarshal(rowsRaw, &rows); err != nil {
-			return
-		}
+	var columns []struct {
+		DisplayName string `json:"displayName"`
+		Name        string `json:"name"`
+	}
+	if err := json.Unmarshal(columnsRaw, &columns); err != nil || len(columns) == 0 {
+		return
+	}
+	var rows []map[string]struct {
+		Data json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(rowsRaw, &rows); err != nil {
+		return
+	}
 
-		// Build markdown table.
-		header := make([]string, len(columns))
+	// Build markdown table.
+	header := make([]string, len(columns))
+	for i, col := range columns {
+		header[i] = col.DisplayName
+	}
+	*parts = append(*parts, "| "+strings.Join(header, " | ")+" |")
+	sep := make([]string, len(columns))
+	for i := range sep {
+		sep[i] = "---"
+	}
+	*parts = append(*parts, "| "+strings.Join(sep, " | ")+" |")
+
+	for _, row := range rows {
+		cells := make([]string, len(columns))
 		for i, col := range columns {
-			header[i] = col.DisplayName
+			cell := row[col.Name]
+			var cellParts []string
+			walkCardValue(cell.Data, &cellParts)
+			cells[i] = strings.Join(cellParts, " ")
 		}
-		*parts = append(*parts, "| "+strings.Join(header, " | ")+" |")
-		sep := make([]string, len(columns))
-		for i := range sep {
-			sep[i] = "---"
-		}
-		*parts = append(*parts, "| "+strings.Join(sep, " | ")+" |")
+		*parts = append(*parts, "| "+strings.Join(cells, " | ")+" |")
+	}
+}
 
-		for _, row := range rows {
-			cells := make([]string, len(columns))
-			for i, col := range columns {
-				cell := row[col.Name]
-				var cellParts []string
-				walkCardValue(cell.Data, &cellParts)
-				cells[i] = strings.Join(cellParts, " ")
-			}
-			*parts = append(*parts, "| "+strings.Join(cells, " | ")+" |")
+// extractCardListItems extracts text from a Feishu card list element.
+// List structure: property.items is an array of items, each with an "elements" array.
+func extractCardListItems(itemsRaw json.RawMessage, parts *[]string) {
+	var items []struct {
+		Elements []json.RawMessage `json:"elements"`
+	}
+	if err := json.Unmarshal(itemsRaw, &items); err != nil {
+		return
+	}
+	for _, item := range items {
+		var itemParts []string
+		for _, elem := range item.Elements {
+			walkCardValue(elem, &itemParts)
+		}
+		if len(itemParts) > 0 {
+			*parts = append(*parts, "- "+strings.Join(itemParts, " "))
 		}
 	}
-
-	// extractCardListItems extracts text from a Feishu card list element.
-	// List structure: property.items is an array of items, each with an "elements" array.
-	func extractCardListItems(itemsRaw json.RawMessage, parts *[]string) {
-		var items []struct {
-			Elements []json.RawMessage `json:"elements"`
-		}
-		if err := json.Unmarshal(itemsRaw, &items); err != nil {
-			return
-		}
-		for _, item := range items {
-			var itemParts []string
-			for _, elem := range item.Elements {
-				walkCardValue(elem, &itemParts)
-			}
-			if len(itemParts) > 0 {
-				*parts = append(*parts, "- "+strings.Join(itemParts, " "))
-			}
-		}
-	}
+}
 
 // parseMergeForward fetches sub-messages of a merge_forward message via the
 // GET /open-apis/im/v1/messages/{message_id} API, then formats them into
@@ -3043,33 +3049,28 @@ func stripMentions(text string, mentions []*larkim.MentionEvent, botOpenID strin
 // TODO: Session-key derivation and reply-thread behavior are split across multiple code paths here.
 // Should revisit thread/root handling without changing thread_isolation=false behavior.
 func (p *Platform) makeSessionKey(msg *larkim.EventMessage, chatID, userID string) string {
-	// Use configured strategy if set
 	if p.sessionKeyStrategy != "" {
 		switch p.sessionKeyStrategy {
-		case "thread":
-			// Thread-level isolation: same thread = same session
-			if msg != nil {
-				threadID := stringValue(msg.ThreadId)
-				if threadID != "" {
+		case "hybrid":
+			if msg != nil && stringValue(msg.ChatType) == "group" {
+				if threadID := messageThreadIdentity(msg); threadID != "" {
 					return fmt.Sprintf("%s:%s:thread:%s", p.tag(), chatID, threadID)
 				}
-				// Fallback to rootID for thread-like behavior
-				rootID := stringValue(msg.RootId)
-				if rootID != "" {
-					return fmt.Sprintf("%s:%s:thread:%s", p.tag(), chatID, rootID)
-				}
-				// Do NOT fallback to msg.MessageId here — it's unique per message
-				// and would create a new session for every message in the thread.
 			}
-			// Fallback to user-level for non-thread messages
+			return fmt.Sprintf("%s:%s:user:%s", p.tag(), chatID, userID)
+
+		case "thread":
+			if msg != nil {
+				if threadID := messageThreadIdentity(msg); threadID != "" {
+					return fmt.Sprintf("%s:%s:thread:%s", p.tag(), chatID, threadID)
+				}
+			}
 			return fmt.Sprintf("%s:%s:user:%s", p.tag(), chatID, userID)
 
 		case "chat":
-			// Chat-level: entire chat shares one session
 			return fmt.Sprintf("%s:%s", p.tag(), chatID)
 
-		default: // "user"
-			// User-level (default): same user = same session
+		case "user":
 			return fmt.Sprintf("%s:%s:user:%s", p.tag(), chatID, userID)
 		}
 	}
@@ -3090,6 +3091,41 @@ func (p *Platform) makeSessionKey(msg *larkim.EventMessage, chatID, userID strin
 	return fmt.Sprintf("%s:%s:%s", p.tag(), chatID, userID)
 }
 
+func messageThreadIdentity(msg *larkim.EventMessage) string {
+	if msg == nil {
+		return ""
+	}
+	if threadID := stringValue(msg.ThreadId); threadID != "" {
+		return threadID
+	}
+	if rootID := stringValue(msg.RootId); rootID != "" {
+		return rootID
+	}
+	if stringValue(msg.ChatType) == "group" {
+		return stringValue(msg.MessageId)
+	}
+	return ""
+}
+
+func (p *Platform) makeReplyContext(msg *larkim.EventMessage, messageID, chatID, sessionKey string) replyContext {
+	rc := replyContext{messageID: messageID, chatID: chatID, sessionKey: sessionKey}
+	if msg == nil {
+		return rc
+	}
+	if p.sessionKeyStrategy == "hybrid" || p.sessionKeyStrategy == "thread" {
+		if stringValue(msg.ChatType) == "group" {
+			rc.threadID = messageThreadIdentity(msg)
+			rc.replyInThread = rc.threadID != ""
+		}
+		return rc
+	}
+	if p.threadIsolation && isThreadSessionKey(sessionKey) {
+		rc.threadID = messageThreadIdentity(msg)
+		rc.replyInThread = true
+	}
+	return rc
+}
+
 func (p *Platform) sessionKeyFromCardAction(chatID, userID string, value map[string]any) string {
 	if value != nil {
 		if sessionKey, _ := value["session_key"].(string); sessionKey != "" {
@@ -3106,11 +3142,12 @@ func (p *Platform) shouldReplyInThread(rc replyContext) bool {
 	if rc.messageID == "" {
 		return false
 	}
-	// Support new sessionKeyStrategy
-	if p.sessionKeyStrategy == "thread" {
+	if rc.replyInThread {
+		return true
+	}
+	if p.sessionKeyStrategy == "hybrid" || p.sessionKeyStrategy == "thread" {
 		return isThreadSessionKey(rc.sessionKey)
 	}
-	// Legacy behavior
 	return p.threadIsolation && isThreadSessionKey(rc.sessionKey)
 }
 
@@ -3343,6 +3380,8 @@ func (p *Platform) ReconstructReplyCtx(sessionKey string) (any, error) {
 	if len(parts) == 3 {
 		if rootID, ok := parseThreadRootID(parts[2]); ok {
 			rc.messageID = rootID
+			rc.threadID = rootID
+			rc.replyInThread = true
 		}
 	}
 	return rc, nil
