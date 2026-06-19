@@ -793,6 +793,112 @@ func TestLark_ThreadIsolationUsesRootSessionKey(t *testing.T) {
 	}
 }
 
+func TestFeishu_ThreadIsolationMentionedReplyIncludesQuotedParent(t *testing.T) {
+	const appID = "cli_quote_parent"
+	const appSecret = "secret-quote-parent"
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/open-apis/im/v1/messages/om_parent":
+			writeJSON(t, w, map[string]any{
+				"code": 0,
+				"data": map[string]any{
+					"items": []map[string]any{
+						{
+							"msg_type": "text",
+							"sender": map[string]any{
+								"id":          "ou_parent",
+								"sender_type": "user",
+							},
+							"body": map[string]any{
+								"content": `{"text":"被引用的报警上下文"}`,
+							},
+						},
+					},
+				},
+			})
+		case strings.HasPrefix(r.URL.Path, "/open-apis/contact/v3/users/"):
+			writeJSON(t, w, map[string]any{"code": 0, "msg": "success"})
+		case strings.HasPrefix(r.URL.Path, "/open-apis/im/v1/chats/"):
+			writeJSON(t, w, map[string]any{"code": 0, "msg": "success"})
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	p := &Platform{
+		platformName:    "feishu",
+		domain:          srv.URL,
+		appID:           appID,
+		appSecret:       appSecret,
+		threadIsolation: true,
+		client: lark.NewClient(appID, appSecret,
+			lark.WithOpenBaseUrl(srv.URL),
+			lark.WithHttpClient(srv.Client()),
+		),
+		replayClient: lark.NewClient(appID, appSecret,
+			lark.WithEnableTokenCache(false),
+			lark.WithOpenBaseUrl(srv.URL),
+			lark.WithHttpClient(srv.Client()),
+		),
+	}
+	p.botOpenID = "ou_bot"
+
+	msgCh := make(chan *core.Message, 1)
+	p.handler = func(_ core.Platform, msg *core.Message) {
+		msgCh <- msg
+	}
+
+	messageID := "om_reply"
+	parentID := "om_parent"
+	rootID := "om_root"
+	chatID := "oc_test"
+	openID := "ou_test"
+	msgType := "text"
+	chatType := "group"
+	senderType := "user"
+	content := `{"text":"@bot 帮我看下这条"}`
+	createText := strconv.FormatInt(time.Now().UnixMilli(), 10)
+
+	if err := p.onMessage(context.Background(), &larkim.P2MessageReceiveV1{
+		Event: &larkim.P2MessageReceiveV1Data{
+			Sender: &larkim.EventSender{
+				SenderId:   &larkim.UserId{OpenId: &openID},
+				SenderType: &senderType,
+			},
+			Message: &larkim.EventMessage{
+				MessageId:   &messageID,
+				ParentId:    &parentID,
+				RootId:      &rootID,
+				ChatId:      &chatID,
+				ChatType:    &chatType,
+				MessageType: &msgType,
+				Content:     &content,
+				CreateTime:  &createText,
+				Mentions: []*larkim.MentionEvent{
+					{
+						Key: stringPtr("@bot"),
+						Id:  &larkim.UserId{OpenId: stringPtr("ou_bot")},
+					},
+				},
+			},
+		},
+	}); err != nil {
+		t.Fatalf("onMessage() error = %v", err)
+	}
+
+	select {
+	case msg := <-msgCh:
+		if !strings.Contains(msg.ExtraContent, "被引用的报警上下文") {
+			t.Fatalf("ExtraContent = %q, want quoted parent text", msg.ExtraContent)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for quoted reply message")
+	}
+}
+
 func TestLark_GroupReplyAllWithThreadIsolationUsesRootSessionKeyWithoutMention(t *testing.T) {
 	p, err := newPlatform("lark", lark.LarkBaseUrl, map[string]any{
 		"app_id": "cli_xxx", "app_secret": "secret", "enable_feishu_card": true,
@@ -856,7 +962,7 @@ func TestLark_GroupReplyAllWithThreadIsolationUsesRootSessionKeyWithoutMention(t
 	}
 }
 
-func TestFeishu_HybridGroupStartUsesMessageThreadSessionAndThreadAck(t *testing.T) {
+func TestFeishu_HybridGroupStartCreatesThreadSessionBeforeDispatch(t *testing.T) {
 	const appID = "cli_hybrid_ack"
 	const appSecret = "secret-hybrid-ack"
 
@@ -880,7 +986,7 @@ func TestFeishu_HybridGroupStartUsesMessageThreadSessionAndThreadAck(t *testing.
 			writeJSON(t, w, map[string]any{
 				"code": 0,
 				"msg":  "success",
-				"data": map[string]any{"message_id": "om_ack"},
+				"data": map[string]any{"message_id": "om_ack", "thread_id": "omt_real_thread"},
 			})
 		case strings.HasPrefix(r.URL.Path, "/open-apis/contact/v3/users/"):
 			writeJSON(t, w, map[string]any{"code": 0, "msg": "success"})
@@ -942,8 +1048,8 @@ func TestFeishu_HybridGroupStartUsesMessageThreadSessionAndThreadAck(t *testing.
 
 	select {
 	case msg := <-msgCh:
-		if msg.SessionKey != "feishu:oc_alerts:thread:om_start" {
-			t.Fatalf("SessionKey = %q, want feishu:oc_alerts:thread:om_start", msg.SessionKey)
+		if msg.SessionKey != "feishu:oc_alerts:thread:omt_real_thread" {
+			t.Fatalf("SessionKey = %q, want feishu:oc_alerts:thread:omt_real_thread", msg.SessionKey)
 		}
 		rc, ok := msg.ReplyCtx.(replyContext)
 		if !ok {
@@ -951,6 +1057,9 @@ func TestFeishu_HybridGroupStartUsesMessageThreadSessionAndThreadAck(t *testing.
 		}
 		if !rc.replyInThread {
 			t.Fatal("replyContext.replyInThread = false, want true")
+		}
+		if rc.threadID != "omt_real_thread" {
+			t.Fatalf("replyContext.threadID = %q, want omt_real_thread", rc.threadID)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for hybrid group message")
@@ -960,7 +1069,25 @@ func TestFeishu_HybridGroupStartUsesMessageThreadSessionAndThreadAck(t *testing.
 		t.Fatalf("reply calls = %d, want 1 ack reply", len(replyBodies))
 	}
 	if got, _ := replyBodies[0]["reply_in_thread"].(bool); !got {
-		t.Fatalf("reply_in_thread = %v, want true in ack reply body", replyBodies[0]["reply_in_thread"])
+		t.Fatalf("reply_in_thread = %v, want true", replyBodies[0]["reply_in_thread"])
+	}
+	content, _ := replyBodies[0]["content"].(string)
+	if !strings.Contains(content, "[session: feishu:oc_alerts:thread:om_start]") {
+		t.Fatalf("ack content = %q, want temporary thread session key", content)
+	}
+	if _, ok := p.ackThrottle.Load("feishu:oc_alerts:thread:omt_real_thread"); !ok {
+		t.Fatal("ack throttle missing real thread session key")
+	}
+
+	rootOnlyMsg := &larkim.EventMessage{
+		MessageId: stringPtr("om_followup"),
+		RootId:    stringPtr("om_start"),
+		ParentId:  stringPtr("om_start"),
+		ChatType:  &chatType,
+	}
+	sessionKey := p.makeSessionKey(rootOnlyMsg, chatID, userID)
+	if sessionKey != "feishu:oc_alerts:thread:omt_real_thread" {
+		t.Fatalf("root-only follow-up sessionKey = %q, want feishu:oc_alerts:thread:omt_real_thread", sessionKey)
 	}
 }
 

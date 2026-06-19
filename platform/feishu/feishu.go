@@ -182,6 +182,11 @@ type Platform struct {
 
 	// ackThrottle tracks the last ack send time per session to avoid spam
 	ackThrottle sync.Map // sessionKey -> time.Time
+
+	// threadIDAliases maps Feishu message/root/parent IDs to the real thread_id
+	// returned by Reply API. It is only used for session routing, never for quote
+	// expansion.
+	threadIDAliases sync.Map // chatID:id -> threadID
 }
 
 type interactivePlatform struct {
@@ -1025,6 +1030,7 @@ func (p *Platform) dispatchCoreMessage(msg *core.Message) {
 					rc.threadID = realThreadID
 					rc.replyInThread = true
 					msg.ReplyCtx = rc
+					p.rememberThreadAliases(chatID, realThreadID, threadIDFromSessionKey(oldKey), rc.messageID)
 					p.ackThrottle.Store(newKey, time.Now())
 					slog.Debug(p.tag()+": session key updated with real thread_id",
 						"old", oldKey, "new", newKey)
@@ -1779,13 +1785,12 @@ func (p *Platform) resolveMentionsInContent(ctx context.Context, chatID, content
 	return result
 }
 
-// chainMessage holds extracted data from one message in a reply chain.
-type chainMessage struct {
+// quotedParent holds extracted data from the directly quoted parent message.
+type quotedParent struct {
 	senderName string
 	senderType string // "user" or "app"
 	text       string
 	images     []core.ImageAttachment
-	parentID   string
 }
 
 type quotedMessage struct {
@@ -1793,22 +1798,19 @@ type quotedMessage struct {
 	images []core.ImageAttachment
 }
 
-// maxReplyChainDepth is the maximum number of parent messages to traverse
-// when building a reply chain. This limits API calls per inbound reply.
-const maxReplyChainDepth = 5
-
 // fetchQuotedMessage retrieves the content of a parent message that the user
 // is replying to, and returns formatted context plus downloaded attachments.
-// For multi-level reply chains, it traces parent_id links up to maxReplyChainDepth
-// levels and returns the full conversation chain.
+// It intentionally fetches only the direct parent. Reply chains are conversation
+// structure, not session boundaries, and recursively expanding them can inject
+// unrelated @bot trigger messages into the agent prompt.
 // Returns empty content on any failure (graceful degradation — the user's own
 // message is still delivered without the quote).
 func (p *Platform) fetchQuotedMessage(ctx context.Context, parentID string) quotedMessage {
-	chain := p.fetchReplyChain(ctx, parentID, maxReplyChainDepth)
-	if len(chain) == 0 {
+	parent := p.fetchSingleMessage(ctx, parentID)
+	if parent == nil {
 		return quotedMessage{}
 	}
-	return quotedMessage{text: formatReplyChain(chain), images: collectReplyChainImages(chain)}
+	return quotedMessage{text: formatQuotedParent(*parent), images: parent.images}
 }
 
 // resolveBotSenderName returns a display name for a bot sender in a quoted
@@ -1826,9 +1828,9 @@ func (p *Platform) resolveBotSenderName(appID string) string {
 	return "Bot[" + appID + "]"
 }
 
-// fetchSingleMessage retrieves one message by ID from the Feishu API and
-// returns its extracted content as a chainMessage. Returns nil on any failure.
-func (p *Platform) fetchSingleMessage(ctx context.Context, messageID string) *chainMessage {
+// fetchSingleMessage retrieves one message by ID from the Feishu API and returns
+// its extracted content. Returns nil on any failure.
+func (p *Platform) fetchSingleMessage(ctx context.Context, messageID string) *quotedParent {
 	apiPath := fmt.Sprintf("/open-apis/im/v1/messages/%s?card_msg_content_type=raw_card_content", messageID)
 	apiResp, err := p.client.Get(ctx, apiPath, nil, larkcore.AccessTokenTypeTenant)
 	if err != nil {
@@ -1839,9 +1841,8 @@ func (p *Platform) fetchSingleMessage(ctx context.Context, messageID string) *ch
 		Code int `json:"code"`
 		Data struct {
 			Items []struct {
-				MsgType  string `json:"msg_type"`
-				ParentID string `json:"parent_id"`
-				Sender   struct {
+				MsgType string `json:"msg_type"`
+				Sender  struct {
 					ID         string `json:"id"`
 					SenderType string `json:"sender_type"`
 				} `json:"sender"`
@@ -1919,78 +1920,16 @@ func (p *Platform) fetchSingleMessage(ctx context.Context, messageID string) *ch
 		senderName = "unknown"
 	}
 
-	return &chainMessage{
+	return &quotedParent{
 		senderName: senderName,
 		senderType: item.Sender.SenderType,
 		text:       text,
 		images:     images,
-		parentID:   item.ParentID,
 	}
 }
 
-func collectReplyChainImages(chain []chainMessage) []core.ImageAttachment {
-	var images []core.ImageAttachment
-	for _, msg := range chain {
-		images = append(images, msg.images...)
-	}
-	return images
-}
-
-// fetchReplyChain iteratively traverses parent_id links to build a reply chain.
-// Returns messages in chronological order (oldest first). Stops on any failure,
-// circular reference, or when maxDepth is reached.
-func (p *Platform) fetchReplyChain(ctx context.Context, parentID string, maxDepth int) []chainMessage {
-	var chain []chainMessage
-	visited := make(map[string]struct{})
-	currentID := parentID
-
-	for currentID != "" && len(chain) < maxDepth {
-		if _, seen := visited[currentID]; seen {
-			slog.Debug(p.tag()+": reply chain: circular reference detected", "message_id", currentID)
-			break
-		}
-		visited[currentID] = struct{}{}
-
-		msg := p.fetchSingleMessage(ctx, currentID)
-		if msg == nil {
-			break
-		}
-		chain = append(chain, *msg)
-		currentID = msg.parentID
-	}
-
-	// Reverse to chronological order (oldest first).
-	for i, j := 0, len(chain)-1; i < j; i, j = i+1, j-1 {
-		chain[i], chain[j] = chain[j], chain[i]
-	}
-	return chain
-}
-
-// formatReplyChain formats a slice of chain messages into a readable string.
-// Single-message chains use the legacy format for backward compatibility.
-// Multi-message chains use a numbered format with role labels.
-func formatReplyChain(chain []chainMessage) string {
-	if len(chain) == 0 {
-		return ""
-	}
-
-	// Single message: backward-compatible format.
-	if len(chain) == 1 {
-		return fmt.Sprintf("[Quoted message from %s]:\n%s\n\n", chain[0].senderName, chain[0].text)
-	}
-
-	// Multi-message: numbered chain format.
-	var b strings.Builder
-	fmt.Fprintf(&b, "--- Reply chain (%d messages) ---\n", len(chain))
-	for i, msg := range chain {
-		role := "user"
-		if msg.senderType == "app" {
-			role = "assistant"
-		}
-		fmt.Fprintf(&b, "[%d] %s (%s):\n%s\n\n", i+1, msg.senderName, role, msg.text)
-	}
-	b.WriteString("---\n\n")
-	return b.String()
+func formatQuotedParent(parent quotedParent) string {
+	return fmt.Sprintf("[Quoted message from %s]:\n%s\n\n", parent.senderName, parent.text)
 }
 
 // extractPostPlainText extracts plain text from a Lark post (rich text) JSON content.
@@ -3099,7 +3038,7 @@ func (p *Platform) makeSessionKey(msg *larkim.EventMessage, chatID, userID strin
 		switch p.sessionKeyStrategy {
 		case "hybrid":
 			if msg != nil && stringValue(msg.ChatType) == "group" {
-				if threadID := messageThreadIdentity(msg); threadID != "" {
+				if threadID := p.resolveThreadID(msg, chatID); threadID != "" {
 					return fmt.Sprintf("%s:%s:thread:%s", p.tag(), chatID, threadID)
 				}
 				// Group chat with no thread yet: use msg_id as a temporary
@@ -3113,7 +3052,7 @@ func (p *Platform) makeSessionKey(msg *larkim.EventMessage, chatID, userID strin
 
 		case "thread":
 			if msg != nil {
-				if threadID := messageThreadIdentity(msg); threadID != "" {
+				if threadID := p.resolveThreadID(msg, chatID); threadID != "" {
 					return fmt.Sprintf("%s:%s:thread:%s", p.tag(), chatID, threadID)
 				}
 				// Group chat with no thread yet: use msg_id as temporary thread ID.
@@ -3152,18 +3091,56 @@ func (p *Platform) usesThreadSessionStrategy() bool {
 	return p.sessionKeyStrategy == "hybrid" || p.sessionKeyStrategy == "thread"
 }
 
-func messageThreadIdentity(msg *larkim.EventMessage) string {
+func (p *Platform) resolveThreadID(msg *larkim.EventMessage, chatID string) string {
 	if msg == nil {
 		return ""
 	}
 	if threadID := stringValue(msg.ThreadId); threadID != "" {
+		p.rememberThreadAliases(chatID, threadID,
+			stringValue(msg.MessageId),
+			stringValue(msg.RootId),
+			stringValue(msg.ParentId),
+		)
 		return threadID
 	}
-	if rootID := stringValue(msg.RootId); rootID != "" {
-		return rootID
+	for _, id := range []string{
+		stringValue(msg.RootId),
+		stringValue(msg.ParentId),
+		stringValue(msg.MessageId),
+	} {
+		if threadID := p.lookupThreadAlias(chatID, id); threadID != "" {
+			p.rememberThreadAliases(chatID, threadID,
+				stringValue(msg.MessageId),
+				stringValue(msg.RootId),
+				stringValue(msg.ParentId),
+			)
+			return threadID
+		}
 	}
-	// Do NOT fallback to MessageId — it's unique per message and would
-	// create different session keys for messages in the same thread.
+	return ""
+}
+
+func (p *Platform) rememberThreadAliases(chatID, threadID string, ids ...string) {
+	if chatID == "" || threadID == "" {
+		return
+	}
+	for _, id := range ids {
+		if id == "" {
+			continue
+		}
+		p.threadIDAliases.Store(chatID+":"+id, threadID)
+	}
+}
+
+func (p *Platform) lookupThreadAlias(chatID, id string) string {
+	if chatID == "" || id == "" {
+		return ""
+	}
+	if v, ok := p.threadIDAliases.Load(chatID + ":" + id); ok {
+		if threadID, ok := v.(string); ok {
+			return threadID
+		}
+	}
 	return ""
 }
 
@@ -3175,6 +3152,14 @@ func chatIDFromSessionKey(sessionKey string) (string, bool) {
 	return parts[1], true
 }
 
+func threadIDFromSessionKey(sessionKey string) string {
+	parts := strings.Split(sessionKey, ":")
+	if len(parts) >= 4 && parts[2] == "thread" {
+		return parts[3]
+	}
+	return ""
+}
+
 func (p *Platform) makeReplyContext(msg *larkim.EventMessage, messageID, chatID, sessionKey string) replyContext {
 	rc := replyContext{messageID: messageID, chatID: chatID, sessionKey: sessionKey}
 	if msg == nil {
@@ -3182,7 +3167,7 @@ func (p *Platform) makeReplyContext(msg *larkim.EventMessage, messageID, chatID,
 	}
 	if p.sessionKeyStrategy == "hybrid" || p.sessionKeyStrategy == "thread" {
 		if stringValue(msg.ChatType) == "group" {
-			rc.threadID = messageThreadIdentity(msg)
+			rc.threadID = p.resolveThreadID(msg, chatID)
 			// Always reply in thread for thread strategy — first message creates
 			// the thread, subsequent messages reuse the threadID.
 			rc.replyInThread = true
@@ -3190,7 +3175,7 @@ func (p *Platform) makeReplyContext(msg *larkim.EventMessage, messageID, chatID,
 		return rc
 	}
 	if p.threadIsolation && isThreadSessionKey(sessionKey) {
-		rc.threadID = messageThreadIdentity(msg)
+		rc.threadID = p.resolveThreadID(msg, chatID)
 		rc.replyInThread = true
 	}
 	return rc

@@ -235,7 +235,7 @@ func TestDispatchMessageKeepsMentionOnlyQuotedText(t *testing.T) {
 					"items": []map[string]any{
 						{
 							"msg_type":  "text",
-							"parent_id": "",
+							"parent_id": "om_grandparent_should_not_fetch",
 							"sender": map[string]any{
 								"id":          "ou_parent",
 								"sender_type": "user",
@@ -247,6 +247,8 @@ func TestDispatchMessageKeepsMentionOnlyQuotedText(t *testing.T) {
 					},
 				},
 			})
+		case r.URL.Path == "/open-apis/im/v1/messages/om_grandparent_should_not_fetch":
+			t.Fatal("quoted message fetch should only read the direct parent")
 		case strings.HasPrefix(r.URL.Path, "/open-apis/contact/v3/users/"):
 			w.Header().Set("Content-Type", "application/json")
 			writeJSON(t, w, map[string]any{"code": 0, "msg": "success"})
@@ -297,6 +299,9 @@ func TestDispatchMessageKeepsMentionOnlyQuotedText(t *testing.T) {
 		}
 		if !strings.Contains(msg.ExtraContent, "请总结这条消息") {
 			t.Fatalf("ExtraContent = %q, want quoted text", msg.ExtraContent)
+		}
+		if strings.Contains(msg.ExtraContent, "Reply chain") || strings.Contains(msg.ExtraContent, "om_grandparent") {
+			t.Fatalf("ExtraContent = %q, want direct parent only", msg.ExtraContent)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for mention-only quoted text message")
