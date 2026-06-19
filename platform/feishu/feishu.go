@@ -114,6 +114,11 @@ type replyContext struct {
 	replyInThread bool
 }
 
+type replyResult struct {
+	messageID string
+	threadID  string
+}
+
 type Platform struct {
 	mu                         sync.RWMutex
 	platformName               string
@@ -1020,17 +1025,21 @@ func (p *Platform) dispatchCoreMessage(msg *core.Message) {
 	// dispatch with the real thread_id as the session boundary.
 	if p.shouldSendAck(msg) && p.usesThreadSessionStrategy() {
 		if rc, ok := msg.ReplyCtx.(replyContext); ok {
-			realThreadID := p.sendAckAndGetThreadID(context.Background(), msg.Content, rc)
-			if realThreadID != "" {
+			ackResult := p.sendAckAndGetThreadID(context.Background(), msg.Content, rc)
+			if ackResult.threadID != "" {
 				oldKey := msg.SessionKey
 				if chatID, ok := chatIDFromSessionKey(oldKey); ok {
-					newKey := fmt.Sprintf("%s:%s:thread:%s", p.tag(), chatID, realThreadID)
+					newKey := fmt.Sprintf("%s:%s:thread:%s", p.tag(), chatID, ackResult.threadID)
 					msg.SessionKey = newKey
 					rc.sessionKey = newKey
-					rc.threadID = realThreadID
+					rc.threadID = ackResult.threadID
 					rc.replyInThread = true
 					msg.ReplyCtx = rc
-					p.rememberThreadAliases(chatID, realThreadID, threadIDFromSessionKey(oldKey), rc.messageID)
+					p.rememberThreadAliases(chatID, ackResult.threadID,
+						threadIDFromSessionKey(oldKey),
+						rc.messageID,
+						ackResult.messageID,
+					)
 					p.ackThrottle.Store(newKey, time.Now())
 					slog.Debug(p.tag()+": session key updated with real thread_id",
 						"old", oldKey, "new", newKey)
@@ -1090,21 +1099,22 @@ func (p *Platform) sendAckMessage(msg *core.Message) {
 	slog.Debug(p.tag()+": ack sent", "session_key", msg.SessionKey, "text", ackText)
 }
 
-// sendAckAndGetThreadID sends the ack as a reply and returns the real thread_id.
-func (p *Platform) sendAckAndGetThreadID(ctx context.Context, content string, rctx replyContext) string {
+// sendAckAndGetThreadID sends the ack as a reply and returns the ack message_id
+// plus real thread_id.
+func (p *Platform) sendAckAndGetThreadID(ctx context.Context, content string, rctx replyContext) replyResult {
 	if !p.shouldSendAckForContent(content) {
-		return ""
+		return replyResult{}
 	}
 	ackText := p.buildAckText(content)
 	ackTextWithKey := fmt.Sprintf("%s\n[session: %s]", ackText, rctx.sessionKey)
 	msgType, msgBody := buildReplyContent(ackTextWithKey)
-	realThreadID, err := p.replyMessage(ctx, rctx, msgType, msgBody)
+	result, err := p.replyMessage(ctx, rctx, msgType, msgBody)
 	if err != nil {
 		slog.Debug(p.tag()+": send ack failed", "error", err)
-		return ""
+		return replyResult{}
 	}
 	p.ackThrottle.Store(rctx.sessionKey, time.Now())
-	return realThreadID
+	return result
 }
 
 // buildAckText determines the ack text based on message content
@@ -3231,13 +3241,14 @@ func (p *Platform) buildReplyMessageReqBody(rc replyContext, msgType, content st
 	return body.Build()
 }
 
-// replyMessage sends a reply and returns the real thread_id if a new thread was created.
-func (p *Platform) replyMessage(ctx context.Context, rc replyContext, msgType, content string) (string, error) {
+// replyMessage sends a reply and returns the created message_id plus real
+// thread_id if a new thread was created.
+func (p *Platform) replyMessage(ctx context.Context, rc replyContext, msgType, content string) (replyResult, error) {
 	req := larkim.NewReplyMessageReqBuilder().
 		MessageId(rc.messageID).
 		Body(p.buildReplyMessageReqBody(rc, msgType, content)).
 		Build()
-	var realThreadID string
+	var result replyResult
 	err := p.withTransientRetry(ctx, "reply", func() error {
 		return p.withFreshTenantAccessTokenRetry(ctx, "reply", func(client *lark.Client, options ...larkcore.RequestOptionFunc) error {
 			resp, err := client.Im.Message.Reply(ctx, req, options...)
@@ -3247,13 +3258,16 @@ func (p *Platform) replyMessage(ctx context.Context, rc replyContext, msgType, c
 			if !resp.Success() {
 				return fmt.Errorf("%s: reply failed code=%d msg=%s", p.tag(), resp.Code, resp.Msg)
 			}
+			if resp.Data != nil && resp.Data.MessageId != nil && *resp.Data.MessageId != "" {
+				result.messageID = *resp.Data.MessageId
+			}
 			if resp.Data != nil && resp.Data.ThreadId != nil && *resp.Data.ThreadId != "" {
-				realThreadID = *resp.Data.ThreadId
+				result.threadID = *resp.Data.ThreadId
 			}
 			return nil
 		})
 	})
-	return realThreadID, err
+	return result, err
 }
 
 func (p *Platform) createMessage(ctx context.Context, chatID, msgType, content, op string) error {
