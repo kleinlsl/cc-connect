@@ -1132,6 +1132,10 @@ func (p *Platform) buildAckText(content string) string {
 
 // shouldSendAckForContent checks if an ack should be sent for this content
 func (p *Platform) shouldSendAckForContent(content string) bool {
+	// Thread strategy always needs ack to create the thread, even for empty content.
+	if p.usesThreadSessionStrategy() {
+		return true
+	}
 	trimmed := strings.TrimSpace(content)
 	return len(trimmed) >= 3
 }
