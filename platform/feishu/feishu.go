@@ -182,11 +182,6 @@ type Platform struct {
 
 	// ackThrottle tracks the last ack send time per session to avoid spam
 	ackThrottle sync.Map // sessionKey -> time.Time
-
-	// pendingThreadSessions maps temporary thread IDs (msg_id used as fallback)
-	// to real thread IDs when the first message creates a thread via reply.
-	// Key: tempID (msg_id), Value: real thread_id from Feishu API response.
-	pendingThreadSessions sync.Map // tempID -> realThreadID
 }
 
 type interactivePlatform struct {
@@ -1020,8 +1015,8 @@ func (p *Platform) dispatchCoreMessage(msg *core.Message) {
 	// session key with the real thread_id from the API response.
 	if p.shouldSendAck(msg) && p.sessionKeyStrategy == "thread" {
 		if rc, ok := msg.ReplyCtx.(replyContext); ok {
-			realThreadID := p.sendAckAndGetThreadID(context.Background(), msg.Content, rc, msg.MessageID, msg.SessionKey)
-			if realThreadID != "" && realThreadID != msg.SessionKey {
+			realThreadID := p.sendAckAndGetThreadID(context.Background(), msg.Content, rc)
+			if realThreadID != "" {
 				oldKey := msg.SessionKey
 				parts := strings.SplitN(oldKey, ":", 4)
 				if len(parts) == 3 {
@@ -1029,7 +1024,7 @@ func (p *Platform) dispatchCoreMessage(msg *core.Message) {
 					newKey := fmt.Sprintf("%s:%s:thread:%s", p.platformName, chatID, realThreadID)
 					msg.SessionKey = newKey
 					slog.Debug(p.tag()+": session key updated with real thread_id",
-						"old", oldKey, "new", newKey, "real_thread_id", realThreadID)
+						"old", oldKey, "new", newKey)
 				}
 			}
 		}
@@ -1086,22 +1081,18 @@ func (p *Platform) sendAckMessage(msg *core.Message) {
 	slog.Debug(p.tag()+": ack sent", "session_key", msg.SessionKey, "text", ackText)
 }
 
-// sendAckAndGetThreadID sends the ack message and returns the real thread_id
-// from the Feishu API response. Used for thread strategy: send ack first to
-// create the thread, then compute the session key with the real thread_id.
-func (p *Platform) sendAckAndGetThreadID(ctx context.Context, content string, rctx replyContext, msgID, sessionKey string) string {
+// sendAckAndGetThreadID sends the ack as a reply and returns the real thread_id.
+func (p *Platform) sendAckAndGetThreadID(ctx context.Context, content string, rctx replyContext) string {
 	if !p.shouldSendAckForContent(content) {
 		return ""
 	}
 	ackText := p.buildAckText(content)
-	ackTextWithKey := fmt.Sprintf("%s\n[session: %s]", ackText, sessionKey)
-	if err := p.Send(ctx, rctx, ackTextWithKey); err != nil {
+	realThreadID, err := p.replyMessage(ctx, rctx, "text", ackText)
+	if err != nil {
 		slog.Debug(p.tag()+": send ack failed", "error", err)
 		return ""
 	}
-	// replyMessage stored the mapping: msgID → realThreadID
-	// Look it up now.
-	return p.resolveRealThreadID(msgID)
+	return realThreadID
 }
 
 // buildAckText determines the ack text based on message content
@@ -2390,7 +2381,8 @@ func (p *Platform) Reply(ctx context.Context, rctx any, content string) error {
 	if !p.shouldUseThreadOrReplyAPI(rc) {
 		return p.sendNewMessageToChat(ctx, rc, msgType, msgBody)
 	}
-	return p.replyMessage(ctx, rc, msgType, msgBody)
+	_, err := p.replyMessage(ctx, rc, msgType, msgBody)
+	return err
 }
 
 // Send sends a message. When the original message ID is available, the message
@@ -2428,7 +2420,8 @@ func (p *Platform) SendWithStatusFooter(ctx context.Context, rctx any, content, 
 	processedFooter := sanitizeMarkdownURLs(preprocessFeishuMarkdown(footer))
 	cardJSON := buildCardJSONWithStatusFooter(processedBody, processedFooter)
 	if p.shouldUseThreadOrReplyAPI(rc) {
-		return p.replyMessage(ctx, rc, larkim.MsgTypeInteractive, cardJSON)
+		_, err := p.replyMessage(ctx, rc, larkim.MsgTypeInteractive, cardJSON)
+		return err
 	}
 	return p.sendNewMessageToChat(ctx, rc, larkim.MsgTypeInteractive, cardJSON)
 }
@@ -2530,7 +2523,8 @@ func (p *Platform) SendFile(ctx context.Context, rctx any, file core.FileAttachm
 
 func (p *Platform) sendMediaMessage(ctx context.Context, rc replyContext, msgType, content string) error {
 	if p.shouldUseThreadOrReplyAPI(rc) {
-		return p.replyMessage(ctx, rc, msgType, content)
+		_, err := p.replyMessage(ctx, rc, msgType, content)
+		return err
 	}
 	return p.createMessage(ctx, rc.chatID, msgType, content, "send media message")
 }
@@ -3107,16 +3101,10 @@ func (p *Platform) makeSessionKey(msg *larkim.EventMessage, chatID, userID strin
 		case "thread":
 			if msg != nil {
 				if threadID := messageThreadIdentity(msg); threadID != "" {
-					// Check if this is a real thread_id that maps to a temp ID.
-					// If so, use the temp ID so the session key matches the first message.
-					if tempID, ok := p.pendingThreadSessions.Load(threadID); ok {
-						return fmt.Sprintf("%s:%s:thread:%s", p.tag(), chatID, tempID.(string))
-					}
 					return fmt.Sprintf("%s:%s:thread:%s", p.tag(), chatID, threadID)
 				}
-				// Group chat with no thread yet: use msg_id as temporary thread ID
-				// so the first message gets a thread-level session key.
-				// reply_in_thread=true in makeReplyContext will create the real thread.
+				// Group chat with no thread yet: use msg_id as temporary thread ID.
+				// dispatchCoreMessage will recompute with real thread_id after ack.
 				if stringValue(msg.ChatType) == "group" {
 					return fmt.Sprintf("%s:%s:thread:%s", p.tag(), chatID, stringValue(msg.MessageId))
 				}
@@ -3233,12 +3221,14 @@ func (p *Platform) buildReplyMessageReqBody(rc replyContext, msgType, content st
 	return body.Build()
 }
 
-func (p *Platform) replyMessage(ctx context.Context, rc replyContext, msgType, content string) error {
+// replyMessage sends a reply and returns the real thread_id if a new thread was created.
+func (p *Platform) replyMessage(ctx context.Context, rc replyContext, msgType, content string) (string, error) {
 	req := larkim.NewReplyMessageReqBuilder().
 		MessageId(rc.messageID).
 		Body(p.buildReplyMessageReqBody(rc, msgType, content)).
 		Build()
-	return p.withTransientRetry(ctx, "reply", func() error {
+	var realThreadID string
+	err := p.withTransientRetry(ctx, "reply", func() error {
 		return p.withFreshTenantAccessTokenRetry(ctx, "reply", func(client *lark.Client, options ...larkcore.RequestOptionFunc) error {
 			resp, err := client.Im.Message.Reply(ctx, req, options...)
 			if err != nil {
@@ -3247,35 +3237,13 @@ func (p *Platform) replyMessage(ctx context.Context, rc replyContext, msgType, c
 			if !resp.Success() {
 				return fmt.Errorf("%s: reply failed code=%d msg=%s", p.tag(), resp.Code, resp.Msg)
 			}
-			// Capture real thread_id from reply response for thread session mapping.
-			// When reply_in_thread creates a new thread, the response contains the
-			// real thread_id. Store bidirectional mapping using the ORIGINAL message_id
-			// (rc.messageID) as the temp key, since for the first message rc.threadID is empty.
 			if resp.Data != nil && resp.Data.ThreadId != nil && *resp.Data.ThreadId != "" {
-				if rc.threadID != "" && rc.threadID != *resp.Data.ThreadId {
-					// Has a temp thread_id: map temp ↔ real
-					p.pendingThreadSessions.Store(rc.threadID, *resp.Data.ThreadId)
-					p.pendingThreadSessions.Store(*resp.Data.ThreadId, rc.threadID)
-					slog.Debug(p.tag()+": stored thread mapping", "temp", rc.threadID, "real", *resp.Data.ThreadId)
-				} else if rc.threadID == "" && rc.messageID != "" {
-					// No temp thread_id (first message): map msg_id ↔ real
-					p.pendingThreadSessions.Store(rc.messageID, *resp.Data.ThreadId)
-					p.pendingThreadSessions.Store(*resp.Data.ThreadId, rc.messageID)
-					slog.Debug(p.tag()+": stored thread mapping from msg_id", "msg_id", rc.messageID, "real", *resp.Data.ThreadId)
-				}
+				realThreadID = *resp.Data.ThreadId
 			}
 			return nil
 		})
 	})
-}
-
-// resolveRealThreadID looks up a temporary thread ID and returns the real one.
-// If the tempID has a mapping, returns the real thread_id; otherwise returns tempID as-is.
-func (p *Platform) resolveRealThreadID(tempID string) string {
-	if realID, ok := p.pendingThreadSessions.Load(tempID); ok {
-		return realID.(string)
-	}
-	return tempID
+	return realThreadID, err
 }
 
 func (p *Platform) createMessage(ctx context.Context, chatID, msgType, content, op string) error {

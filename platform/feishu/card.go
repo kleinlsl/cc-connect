@@ -31,7 +31,8 @@ func (p *interactivePlatform) ReplyCard(ctx context.Context, rctx any, card *cor
 		}
 		return p.createMessage(ctx, rc.chatID, larkim.MsgTypeInteractive, cardJSON, "send card")
 	}
-	return p.replyMessage(ctx, rc, larkim.MsgTypeInteractive, cardJSON)
+	_, err := p.replyMessage(ctx, rc, larkim.MsgTypeInteractive, cardJSON)
+	return err
 }
 
 // SendCard sends a structured card as a new message to the chat.
