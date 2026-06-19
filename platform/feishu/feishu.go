@@ -182,6 +182,11 @@ type Platform struct {
 
 	// ackThrottle tracks the last ack send time per session to avoid spam
 	ackThrottle sync.Map // sessionKey -> time.Time
+
+	// pendingThreadSessions maps temporary thread IDs (msg_id used as fallback)
+	// to real thread IDs when the first message creates a thread via reply.
+	// Key: tempID (msg_id), Value: real thread_id from Feishu API response.
+	pendingThreadSessions sync.Map // tempID -> realThreadID
 }
 
 type interactivePlatform struct {
@@ -3063,6 +3068,11 @@ func (p *Platform) makeSessionKey(msg *larkim.EventMessage, chatID, userID strin
 		case "thread":
 			if msg != nil {
 				if threadID := messageThreadIdentity(msg); threadID != "" {
+					// Check if this is a real thread_id that maps to a temp ID.
+					// If so, use the temp ID so the session key matches the first message.
+					if tempID, ok := p.pendingThreadSessions.Load(threadID); ok {
+						return fmt.Sprintf("%s:%s:thread:%s", p.tag(), chatID, tempID.(string))
+					}
 					return fmt.Sprintf("%s:%s:thread:%s", p.tag(), chatID, threadID)
 				}
 				// Group chat with no thread yet: use msg_id as temporary thread ID
@@ -3198,9 +3208,30 @@ func (p *Platform) replyMessage(ctx context.Context, rc replyContext, msgType, c
 			if !resp.Success() {
 				return fmt.Errorf("%s: reply failed code=%d msg=%s", p.tag(), resp.Code, resp.Msg)
 			}
+			// Capture real thread_id from reply response for thread session mapping.
+			// When reply_in_thread creates a new thread, the response contains the
+			// real thread_id. Store bidirectional mapping so:
+			// - tempID → realThreadID (for resolveRealThreadID)
+			// - realThreadID → tempID (for makeSessionKey to find the first message's key)
+			if resp.Data != nil && resp.Data.ThreadId != nil && *resp.Data.ThreadId != "" {
+				if rc.threadID != "" && rc.threadID != *resp.Data.ThreadId {
+					p.pendingThreadSessions.Store(rc.threadID, *resp.Data.ThreadId)
+					p.pendingThreadSessions.Store(*resp.Data.ThreadId, rc.threadID)
+					slog.Debug(p.tag()+": stored thread mapping", "temp", rc.threadID, "real", *resp.Data.ThreadId)
+				}
+			}
 			return nil
 		})
 	})
+}
+
+// resolveRealThreadID looks up a temporary thread ID and returns the real one.
+// If the tempID has a mapping, returns the real thread_id; otherwise returns tempID as-is.
+func (p *Platform) resolveRealThreadID(tempID string) string {
+	if realID, ok := p.pendingThreadSessions.Load(tempID); ok {
+		return realID.(string)
+	}
+	return tempID
 }
 
 func (p *Platform) createMessage(ctx context.Context, chatID, msgType, content, op string) error {
