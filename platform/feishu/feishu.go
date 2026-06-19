@@ -1079,8 +1079,9 @@ func (p *Platform) shouldSendAck(msg *core.Message) bool {
 	}
 
 	// Don't ack very short messages (ack only for substantive messages)
+	// Exception: thread strategy needs ack to create the thread even for empty content.
 	content := strings.TrimSpace(msg.Content)
-	if len(content) < 3 {
+	if len(content) < 3 && !p.usesThreadSessionStrategy() {
 		return false
 	}
 
