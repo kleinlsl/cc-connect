@@ -3102,9 +3102,8 @@ func messageThreadIdentity(msg *larkim.EventMessage) string {
 	if rootID := stringValue(msg.RootId); rootID != "" {
 		return rootID
 	}
-	if stringValue(msg.ChatType) == "group" {
-		return stringValue(msg.MessageId)
-	}
+	// Do NOT fallback to MessageId — it's unique per message and would
+	// create different session keys for messages in the same thread.
 	return ""
 }
 
