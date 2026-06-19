@@ -3065,6 +3065,12 @@ func (p *Platform) makeSessionKey(msg *larkim.EventMessage, chatID, userID strin
 				if threadID := messageThreadIdentity(msg); threadID != "" {
 					return fmt.Sprintf("%s:%s:thread:%s", p.tag(), chatID, threadID)
 				}
+				// Group chat with no thread yet: use msg_id as temporary thread ID
+				// so the first message gets a thread-level session key.
+				// reply_in_thread=true in makeReplyContext will create the real thread.
+				if stringValue(msg.ChatType) == "group" {
+					return fmt.Sprintf("%s:%s:thread:%s", p.tag(), chatID, stringValue(msg.MessageId))
+				}
 			}
 			return fmt.Sprintf("%s:%s:user:%s", p.tag(), chatID, userID)
 
@@ -3115,7 +3121,9 @@ func (p *Platform) makeReplyContext(msg *larkim.EventMessage, messageID, chatID,
 	if p.sessionKeyStrategy == "hybrid" || p.sessionKeyStrategy == "thread" {
 		if stringValue(msg.ChatType) == "group" {
 			rc.threadID = messageThreadIdentity(msg)
-			rc.replyInThread = rc.threadID != ""
+			// Always reply in thread for thread strategy — first message creates
+			// the thread, subsequent messages reuse the threadID.
+			rc.replyInThread = true
 		}
 		return rc
 	}
