@@ -1325,7 +1325,7 @@ func (p *Platform) onMessage(ctx context.Context, event *larkim.P2MessageReceive
 	// blocked by IO-heavy operations (image/audio download, handler HTTP calls).
 	// The dedup and old-message checks above remain synchronous to guarantee
 	// correctness before spawning the goroutine.
-	go p.dispatchMessage(ctx, msgType, content, mentions, messageID, sessionKey, userID, chatID, rctx, parentID, createTimeMs)
+	go p.dispatchMessage(ctx, msgType, content, mentions, messageID, sessionKey, userID, chatID, rctx, parentID, stringValue(msg.ThreadId), createTimeMs)
 
 	return nil
 }
@@ -1342,7 +1342,7 @@ func (p *Platform) replyUnauthorizedAccess(ctx context.Context, rctx replyContex
 // dispatchMessage handles the message content parsing, media download, and
 // handler invocation. It runs in its own goroutine so that onMessage returns
 // quickly and does not block the SDK event loop.
-func (p *Platform) dispatchMessage(ctx context.Context, msgType, content string, mentions []*larkim.MentionEvent, messageID, sessionKey, userID, chatID string, rctx replyContext, parentID string, createTimeMs int64) {
+func (p *Platform) dispatchMessage(ctx context.Context, msgType, content string, mentions []*larkim.MentionEvent, messageID, sessionKey, userID, chatID string, rctx replyContext, parentID, threadID string, createTimeMs int64) {
 	if p.isMessageRecalled(messageID) {
 		slog.Debug(p.tag()+": recalled message ignored in async dispatch", "message_id", messageID)
 		return
@@ -1361,7 +1361,10 @@ func (p *Platform) dispatchMessage(ctx context.Context, msgType, content string,
 	// already provides context and long quotes can drown out the user's text
 	// (issue #764). Explicit @bot replies always fetch the quote.
 	var quoted quotedMessage
-	if parentID != "" && !isThreadSessionKey(sessionKey) {
+	// Only skip quote in messages that are ACTUALLY inside a thread (have thread_id).
+	// Don't use sessionKey format — the first message uses msg_id as temp thread ID
+	// but is not actually in a thread yet.
+	if parentID != "" && threadID == "" {
 		quoted = p.fetchQuotedMessage(ctx, parentID)
 	}
 
