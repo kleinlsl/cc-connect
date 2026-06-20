@@ -1180,6 +1180,17 @@ func (p *Platform) onMessage(ctx context.Context, event *larkim.P2MessageReceive
 	msg := event.Event.Message
 	sender := event.Event.Sender
 
+	// Log raw event at entry point to distinguish "not received" vs "filtered"
+	slog.Debug(p.tag()+": onMessage entry",
+		"message_id", stringValue(msg.MessageId),
+		"chat_id", stringValue(msg.ChatId),
+		"msg_type", stringValue(msg.MessageType),
+		"parent_id", stringValue(msg.ParentId),
+		"root_id", stringValue(msg.RootId),
+		"thread_id", stringValue(msg.ThreadId),
+		"content_len", len(stringValue(msg.Content)),
+	)
+
 	msgType := ""
 	if msg.MessageType != nil {
 		msgType = *msg.MessageType
