@@ -157,6 +157,17 @@ func TestDispatchMessageIncludesQuotedImage(t *testing.T) {
 					if _, err := w.Write(imageData); err != nil {
 						t.Fatalf("write image: %v", err)
 					}
+				case strings.HasPrefix(r.URL.Path, "/open-apis/im/v1/messages/") && strings.HasSuffix(r.URL.Path, "/reply"):
+					// Ack reply handler — return success with a message_id
+					w.Header().Set("Content-Type", "application/json")
+					replyMsgID := "om_ack_" + r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
+					writeJSON(t, w, map[string]any{
+						"code": 0,
+						"msg":  "success",
+						"data": map[string]any{
+							"message_id": replyMsgID,
+						},
+					})
 				default:
 					t.Fatalf("unexpected path %s", r.URL.Path)
 				}

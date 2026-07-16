@@ -818,10 +818,27 @@ func TestFeishu_ThreadIsolationMentionedReplyIncludesQuotedParent(t *testing.T) 
 					},
 				},
 			})
+		case r.URL.Path == "/open-apis/auth/v3/tenant_access_token/internal":
+			w.Header().Set("Content-Type", "application/json")
+			writeJSON(t, w, map[string]any{
+				"code":                0,
+				"msg":                 "success",
+				"expire":              7200,
+				"tenant_access_token": "tenant-token",
+			})
 		case strings.HasPrefix(r.URL.Path, "/open-apis/contact/v3/users/"):
 			writeJSON(t, w, map[string]any{"code": 0, "msg": "success"})
 		case strings.HasPrefix(r.URL.Path, "/open-apis/im/v1/chats/"):
 			writeJSON(t, w, map[string]any{"code": 0, "msg": "success"})
+		case strings.HasPrefix(r.URL.Path, "/open-apis/im/v1/messages/") && strings.HasSuffix(r.URL.Path, "/reply"):
+			w.Header().Set("Content-Type", "application/json")
+			writeJSON(t, w, map[string]any{
+				"code": 0,
+				"msg":  "success",
+				"data": map[string]any{
+					"message_id": "om_ack_reply",
+				},
+			})
 		default:
 			t.Fatalf("unexpected path %s", r.URL.Path)
 		}
@@ -834,6 +851,7 @@ func TestFeishu_ThreadIsolationMentionedReplyIncludesQuotedParent(t *testing.T) 
 		appID:           appID,
 		appSecret:       appSecret,
 		threadIsolation: true,
+		dedup:           &core.MessageDedup{},
 		client: lark.NewClient(appID, appSecret,
 			lark.WithOpenBaseUrl(srv.URL),
 			lark.WithHttpClient(srv.Client()),
@@ -900,7 +918,28 @@ func TestFeishu_ThreadIsolationMentionedReplyIncludesQuotedParent(t *testing.T) 
 }
 
 func TestLark_GroupReplyAllWithThreadIsolationUsesRootSessionKeyWithoutMention(t *testing.T) {
-	p, err := newPlatform("lark", lark.LarkBaseUrl, map[string]any{
+	// Set up a mock server for ack replies
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/open-apis/auth/v3/tenant_access_token/internal":
+			writeJSON(t, w, map[string]any{
+				"code": 0, "msg": "success", "expire": 7200,
+				"tenant_access_token": "tenant-token",
+			})
+		case strings.HasPrefix(r.URL.Path, "/open-apis/im/v1/messages/") && strings.HasSuffix(r.URL.Path, "/reply"):
+			writeJSON(t, w, map[string]any{
+				"code": 0, "msg": "success",
+				"data": map[string]any{"message_id": "om_ack_reply"},
+			})
+		default:
+			// Ignore other paths (user/chat resolution etc.)
+			writeJSON(t, w, map[string]any{"code": 0, "msg": "success"})
+		}
+	}))
+	defer srv.Close()
+
+	p, err := newPlatform("lark", srv.URL, map[string]any{
 		"app_id": "cli_xxx", "app_secret": "secret", "enable_feishu_card": true,
 		"group_reply_all": true, "thread_isolation": true,
 	})
@@ -988,6 +1027,14 @@ func TestFeishu_HybridGroupStartCreatesThreadSessionBeforeDispatch(t *testing.T)
 				"msg":  "success",
 				"data": map[string]any{"message_id": "om_ack", "thread_id": "omt_real_thread"},
 			})
+		case r.URL.Path == "/open-apis/auth/v3/tenant_access_token/internal":
+			w.Header().Set("Content-Type", "application/json")
+			writeJSON(t, w, map[string]any{
+				"code":                0,
+				"msg":                 "success",
+				"expire":              7200,
+				"tenant_access_token": "tenant-token",
+			})
 		case strings.HasPrefix(r.URL.Path, "/open-apis/contact/v3/users/"):
 			writeJSON(t, w, map[string]any{"code": 0, "msg": "success"})
 		case strings.HasPrefix(r.URL.Path, "/open-apis/im/v1/chats/"):
@@ -1004,6 +1051,7 @@ func TestFeishu_HybridGroupStartCreatesThreadSessionBeforeDispatch(t *testing.T)
 		appID:              appID,
 		appSecret:          appSecret,
 		sessionKeyStrategy: "hybrid",
+		dedup:           &core.MessageDedup{},
 		client: lark.NewClient(appID, appSecret,
 			lark.WithOpenBaseUrl(srv.URL),
 			lark.WithHttpClient(srv.Client()),
@@ -1977,7 +2025,27 @@ func TestAllowChat_FiltersGroupMessages(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			p, err := newPlatform("feishu", lark.FeishuBaseUrl, map[string]any{
+			// Mock server for ack replies when messages pass through
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch {
+				case r.URL.Path == "/open-apis/auth/v3/tenant_access_token/internal":
+					writeJSON(t, w, map[string]any{
+						"code": 0, "msg": "success", "expire": 7200,
+						"tenant_access_token": "tenant-token",
+					})
+				case strings.HasPrefix(r.URL.Path, "/open-apis/im/v1/messages/") && strings.HasSuffix(r.URL.Path, "/reply"):
+					writeJSON(t, w, map[string]any{
+						"code": 0, "msg": "success",
+						"data": map[string]any{"message_id": "om_ack_reply"},
+					})
+				default:
+					writeJSON(t, w, map[string]any{"code": 0, "msg": "success"})
+				}
+			}))
+			defer srv.Close()
+
+			p, err := newPlatform("feishu", srv.URL, map[string]any{
 				"app_id": "cli_xxx", "app_secret": "secret",
 				"enable_feishu_card": true,
 				"group_reply_all":    true,
