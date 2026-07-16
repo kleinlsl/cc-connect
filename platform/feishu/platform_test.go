@@ -2111,10 +2111,10 @@ func TestResolveMentions_ReplacesKnownMember(t *testing.T) {
 	})
 	input := "巡检完成，@张三 @李四 请查看"
 	result := p.resolveMentionsInContent(context.Background(), "oc_chat", input)
-	if !strings.Contains(result, `<at user_id="ou_zhangsan">张三</at>`) {
+	if !strings.Contains(result, `<at id=ou_zhangsan></at>`) {
 		t.Fatalf("expected 张三 to be resolved, got %q", result)
 	}
-	if !strings.Contains(result, `<at user_id="ou_lisi">李四</at>`) {
+	if !strings.Contains(result, `<at id=ou_lisi></at>`) {
 		t.Fatalf("expected 李四 to be resolved, got %q", result)
 	}
 }
@@ -2146,8 +2146,8 @@ func TestResolveMentions_LongestMatchFirst(t *testing.T) {
 }
 
 // TestResolveMentions_MarkdownContent verifies that @name inside markdown
-// content (which would trigger MsgTypeInteractive) is still resolved to the
-// MsgTypeText at syntax (<at user_id="...">name</at>).
+// content resolves to the card-compatible at syntax (<at id=...></at>)
+// which triggers real mention notifications.
 func TestResolveMentions_MarkdownContent(t *testing.T) {
 	p := &Platform{platformName: "feishu", resolveMentions: true}
 	p.chatMemberCache.Store("oc_chat", &chatMemberEntry{
@@ -2157,11 +2157,8 @@ func TestResolveMentions_MarkdownContent(t *testing.T) {
 	// Content with complex markdown
 	input := "# 巡检报告\n\n@张三 请查看\n\n```\nstatus: ok\n```"
 	result := p.resolveMentionsInContent(context.Background(), "oc_chat", input)
-	if !strings.Contains(result, `<at user_id="ou_zhangsan">张三</at>`) {
-		t.Fatalf("markdown content should resolve to text format <at user_id=...>, got %q", result)
-	}
-	if strings.Contains(result, "<at id=") {
-		t.Fatalf("card format <at id=...> must not be emitted (no mention event); got %q", result)
+	if !strings.Contains(result, `<at id=ou_zhangsan></at>`) {
+		t.Fatalf("markdown content should resolve to card format <at id=...>, got %q", result)
 	}
 }
 
@@ -2211,11 +2208,9 @@ func TestResolveMentions_SpecialCharsEscaped(t *testing.T) {
 	})
 	input := `@A<"B"> 你好`
 	result := p.resolveMentionsInContent(context.Background(), "oc_chat", input)
-	if strings.Contains(result, `<"B">`) {
-		t.Fatalf("special chars should be escaped, got %q", result)
-	}
-	if !strings.Contains(result, "A&lt;") {
-		t.Fatalf("expected HTML-escaped name, got %q", result)
+	// Card format uses <at id=open_id></at> — name is not included in the tag
+	if !strings.Contains(result, `<at id=ou_special></at>`) {
+		t.Fatalf("expected card format at tag, got %q", result)
 	}
 }
 
