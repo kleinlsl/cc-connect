@@ -25,6 +25,22 @@ type ReplyContextReconstructor interface {
 	ReconstructReplyCtx(sessionKey string) (any, error)
 }
 
+// RelayGroupVisibilityTarget is an optional interface for platforms that
+// want to customise the session key used when echoing relay request /
+// response messages into the group chat for visibility.  Platforms that
+// understand the concept of a thread, topic, or sub-conversation can
+// return a thread-scoped session key so the visibility echoes land in
+// the same conversation that triggered the relay; platforms without
+// such a concept simply don't implement this interface and core falls
+// back to the legacy "<platform>:<chatID>:relay" target.
+//
+// Returning (key, true) → core uses key verbatim as the group session
+// key for visibility echoes.
+// Returning ("", false) → core falls back to the legacy default.
+type RelayGroupVisibilityTarget interface {
+	RelayGroupVisibilityKey(callerSessionKey string) (groupSessionKey string, ok bool)
+}
+
 // MessageRecallDetector is an optional interface for platforms that can check
 // whether the message targeted by a reply context was recalled/deleted.
 type MessageRecallDetector interface {
@@ -552,6 +568,14 @@ type ContextCompressor interface {
 	CompressCommand() string
 }
 
+// AgentSessionCanceller is an optional interface for agent sessions that support
+// cancelling the current turn without terminating the session or its underlying
+// process. When implemented, the engine calls CancelTurn instead of Close() for
+// /stop, allowing the session to remain alive for the next user message.
+type AgentSessionCanceller interface {
+	CancelTurn() error
+}
+
 // CommandProvider is an optional interface for agents that expose custom slash
 // commands via local files (e.g. .claude/commands/*.md). The engine scans the
 // returned directories for *.md files and registers them as slash commands.
@@ -560,9 +584,14 @@ type CommandProvider interface {
 }
 
 // SkillProvider is an optional interface for agents that expose skills via
-// local directories (e.g. .claude/skills/<name>/SKILL.md). Each subdirectory
-// containing a SKILL.md is treated as a skill. Skills are project-level and
-// agent-specific — they are NOT shared across different agent types.
+// local directories (e.g. .claude/skills/<name>/SKILL.md). Only the depth-1
+// layout is recognised: each immediate subdirectory of the returned dirs
+// that contains a SKILL.md is registered as a skill. Nested SKILL.md files
+// (e.g. inside `<name>/references/...`) are treated as skill assets and
+// ignored — they match the Claude Code CLI convention (issue #1304) and
+// prevent phantom slash commands from leaking into platform command menus.
+// Skills are project-level and agent-specific — they are NOT shared across
+// different agent types.
 type SkillProvider interface {
 	SkillDirs() []string
 }

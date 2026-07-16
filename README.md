@@ -47,23 +47,35 @@
 <details open>
 <summary>Sponsors</summary>
 
-[![MiniMax](assets/banners/minimax-en.png)](https://platform.minimax.io/subscribe/token-plan?code=lqYrKBvjke&source=link)
+[![Kimi](assets/sponsors/kimi-banner-en.png)](https://www.kimi.com/code/?aff=cc-connect)
 
-MiniMax-M3 pushes the frontier of coding and agentic AI, with a 1M-token context window powered by MiniMax Sparse Attention and natively multimodal capabilities from step zero. It leads across SWE-Bench Pro (59.0), Terminal Bench 2.1 (66.0), VIBE V2 (60.1), SVG-Bench (63.7), KernelBench Hard (28.8), BrowseComp (83.5), GDPval rubrics (74.7), Banker ToolBench (76.1), MCP Atlas (74.2), and OSWorld-verified (70.0). Build, learn, and ship with the MiniMax Token Plan.
+Thanks to [Kimi](https://www.kimi.com/code/?aff=cc-connect) for sponsoring this project! [Kimi K2.7 Code](https://platform.kimi.ai/docs/guide/kimi-k2-7-code-quickstart) is an open-source, coding-focused agentic model developed by Moonshot AI, delivering substantial gains on real-world long-horizon coding tasks and higher end-to-end success across complex software engineering workflows. It also reduces thinking-token usage by approximately 30% compared with K2.6.
 
-[Click here](https://platform.minimax.io/subscribe/token-plan?code=lqYrKBvjke&source=link) to get an exclusive 12% off the MiniMax Token Plan + voucher for cc-connect users!
+With cc-connect, you can bring Kimi CLI from your local machine into Feishu/Lark, DingTalk, Telegram, Slack, Discord, WeChat Work, and other instant messaging tools. Wherever you are, you can continue working on local projects through chat and ask Kimi to inspect or modify code, troubleshoot issues, run commands, and handle automation tasks.
+
+cc-connect already supports Kimi CLI. Try the cost-effective [Kimi Code subscription](https://www.kimi.com/code/?aff=cc-connect) or use the API through the Kimi Open Platform ([中文站](https://platform.kimi.com/?aff=cc-connect)｜[Global](https://platform.kimi.ai/?aff=cc-connect)).
 
 ---
 
 <table>
 <tr>
-<td width="150"><a href="https://aigocode.com/invite/CYY3C85C"><img src="assets/sponsors/aigocode.png" alt="AIGoCode" width="120"></a></td>
-<td>Thanks to AIGoCode for sponsoring this project! AIGoCode is an all-in-one platform that integrates Claude Code, Codex, and the latest Gemini models, providing you with stable, efficient, and highly cost-effective AI coding services. The platform offers flexible subscription plans, zero risk of account suspension, direct access with no VPN required, and lightning-fast responses. AIGoCode has prepared a special benefit for cc-connect users: if you register via <a href="https://aigocode.com/invite/CYY3C85C">this link</a>, you'll receive an extra 10% bonus credit on your first top-up!</td>
+<td width="150"><a href="https://apinebula.com/UrO0q1"><img src="assets/sponsors/apinebula.png" alt="APINEBULA" width="120"></a></td>
+<td>Thanks to APINEBULA for sponsoring this project! APINEBULA, an enterprise-grade AI aggregation platform under Galaxy Video Bureau, leverages extensive platform resources to provide developers, teams, and enterprises with stable, cost-effective access to large language model APIs. The platform integrates leading, full-powered models like Claude, GPT, and Gemini—allowing you to connect to the world's top AI models through a single API, with prices starting as low as 10% of the original cost. Designed for AI programming, Agent development, and business system integration, APINEBULA supports enterprise-grade high concurrency, formal contracts, corporate bank transfers, and invoicing services. APINEBULA provides special discounts for our software users: register using <a href="https://apinebula.com/UrO0q1">this link</a> and enter the "ccconnect" promo code during first recharge to get 10% off.</td>
 </tr>
 
 <tr>
-<td width="150"><a href="https://aihubmix.com/?aff=mGTx"><img src="assets/sponsors/aihubmix.png" alt="AIHubMix" width="120"></a> <b>AIHubMix</b></td>
-<td>Thanks to AIHubMix for sponsoring this project! AIHubMix offers deep integration with 500+ global models including OpenAI, Claude, Gemini, Qwen, DeepSeek, Kimi. Unlimited concurrency, production-grade stability on Google Cloud. One API Key drives all your Agents with native OpenAI/Anthropic/Gemini format support — zero code changes. Pay-as-you-go pricing aligned with official providers, plus free models like coding-glm-5.1-free. <a href="https://aihubmix.com/?aff=mGTx">Click here to sign up!</a></td>
+<td width="150"><a href="https://s.qiniu.com/aUbueu"><img src="assets/sponsors/qiniu.png" alt="七牛云 Qiniu Cloud" width="120"></a></td>
+<td>Thanks to <a href="https://s.qiniu.com/aUbueu">Qiniu Cloud AI</a> for sponsoring this project! Qiniu Cloud (HK:02567) is an enterprise-grade LLM MaaS platform offering one-stop access to 150+ leading global models with full protocol compatibility across all major providers. It covers text, image, audio, video, and file processing across all modalities, serving over 1.69 million enterprise and developer users worldwide. Exclusive offer for cc-connect users: enterprise customers get 12 million free tokens, and refer friends to earn up to billions of tokens in bonus.</td>
+</tr>
+
+<tr>
+<td width="150"><a href="https://api.fenno.ai/register?redirect=/purchase?tab=subscription%26group=16&aff=C7KG6WBS7CQJ"><img src="assets/sponsors/fenno.png" alt="Fenno.ai" width="120"></a></td>
+<td>Thanks to Fenno.ai for sponsoring this project! Fenno.ai is a stable, efficient API relay service currently providing Codex relay with full OpenAI and Anthropic protocol compatibility. It flexibly integrates with mainstream coding tools like Codex, Claude Code, and OpenCode, reliably supporting enterprise-level demands of hundreds of billions of tokens per day. Fenno.ai supports domestic and overseas entity-to-entity settlement and invoicing. Exclusive offer for cc-connect users: subscribe via <a href="https://api.fenno.ai/register?redirect=/purchase?tab=subscription%26group=16&aff=C7KG6WBS7CQJ">this link</a> for an unbeatable Coding Plan at ¥9.9 / $150 credit, and earn up to 20% bonus for each friend you refer.</td>
+</tr>
+
+<tr>
+<td width="150"><a href="https://aigocode.com/invite/CYY3C85C"><img src="assets/sponsors/aigocode.png" alt="AIGoCode" width="120"></a></td>
+<td>Thanks to AIGoCode for sponsoring this project! AIGoCode is an all-in-one platform that integrates Claude Code, Codex, and the latest Gemini models, providing you with stable, efficient, and highly cost-effective AI coding services. The platform offers flexible subscription plans, zero risk of account suspension, direct access with no VPN required, and lightning-fast responses. AIGoCode has prepared a special benefit for cc-connect users: if you register via <a href="https://aigocode.com/invite/CYY3C85C">this link</a>, you'll receive an extra 10% bonus credit on your first top-up!</td>
 </tr>
 
 <tr>
@@ -77,13 +89,14 @@ MiniMax-M3 pushes the frontier of coding and agentic AI, with a 1M-token context
 </tr>
 
 <tr>
-<td width="150"><a href="https://nekocode.ai/?aff=CC-CONNECT"><img src="assets/sponsors/nekocode.jpg" alt="NekoCode" width="120"></a></td>
-<td>Thanks to NekoCode for sponsoring this project! NekoCode provides reliable, stable, and efficient API relay services for Claude and CodeX with transparent pricing. Exclusive 10% discount for cc-connect users with promo code: CC-CONNECT. High-value, stable AI model access for developers. Register via <a href="https://nekocode.ai/?aff=CC-CONNECT">this link</a>.</td>
-</tr>
-
 <tr>
 <td width="150"><a href="https://www.shengsuanyun.com/?from=CH_67XCLZGS"><img src="assets/sponsors/shengsuanyun.svg" alt="Shengsuanyun" width="120"></a></td>
 <td>Thanks to Shengsuanyun for sponsoring this project! Shengsuanyun is a super factory dedicated to serving AI Native Teams, an industrial-grade AI task parallel execution platform, and a model marketplace that aggregates and supplies computing power from domestic and international LLM and image/video multimedia models such as Claude, Chatgpt, and Gemini. It guarantees no reverse engineering or data manipulation, boasts a 99.7% SLA availability across the entire site, and its <a href="https://watch.shengsuanyun.com/status/shengsuanyun">monitoring interface</a> is consistently green. Furthermore, it offers an enterprise-grade customized gateway for refined cost and access control, featuring intelligent routing, security protection, and BYOK enterprise-provided key hosting. The platform is billed on a pay-as-you-go basis and with a tokens plan (coming soon), and invoices are available. New users who register using <a href="https://www.shengsuanyun.com/?from=CH_67XCLZGS">this link</a> will receive 10 yuan in model power and a 10% bonus on their first deposit.</td>
+</tr>
+
+<tr>
+<td width="150"><a href="https://visioncoder.cn"><img src="assets/sponsors/visioncoder.png" alt="VisionCoder" width="120"></a></td>
+<td>Thanks to VisionCoder for supporting this project. <a href="https://visioncoder.cn">VisionCoder Developer Platform</a> is a reliable and efficient API relay service provider, offering access to mainstream AI models such as Claude Code, Codex, and Gemini. It helps developers and teams integrate AI capabilities more easily and improve productivity. Additionally, VisionCoder now offers retail channels for <strong>Claude Max 200</strong> and <strong>GPT Pro 200</strong> <strong>premium accounts</strong>, providing users with instant access to top-tier AI computing power and features.</td>
 </tr>
 
 <tr>
@@ -92,13 +105,18 @@ MiniMax-M3 pushes the frontier of coding and agentic AI, with a 1M-token context
 </tr>
 
 <tr>
-<td width="150"><a href="https://www.aicodemirror.com/register?invitecode=KDHMUP"><img src="assets/sponsors/aicodemirror.jpg" alt="AICodeMirror" width="120"></a></td>
-<td>Thanks to AICodeMirror for sponsoring this project! AICodeMirror provides official high-stability relay services for Claude Code / Codex / Gemini CLI, with enterprise-grade concurrency, fast invoicing, and 24/7 dedicated technical support. Claude Code / Codex / Gemini official channels at 38% / 2% / 9% of original price, with extra discounts on top-ups! AICodeMirror offers special benefits for CC users: register via <a href="https://www.aicodemirror.com/register?invitecode=KDHMUP">this link</a> to enjoy 20% off your first top-up, and enterprise customers can get up to 25% off!</td>
+<td width="150"><a href="https://camel.kr777.top/register?aff=V2z8"><img src="assets/sponsors/camel_logo.png" alt="CaMeL" width="120"></a></td>
+<td>Thanks to CaMeL for sponsoring this project! In-depth cooperation with major research institutes and supercomputing centers, self-developed high-stability high-efficiency cache scheduling solution. Exclusive for cc-connect users: New registration authentication immediately receive $10 credit upon registration. Register via <a href="https://camel.kr777.top/register?aff=V2z8">this link</a>.</td>
 </tr>
 
 <tr>
-<td width="150"><a href="https://camel.kr777.top/register?aff=V2z8"><img src="assets/sponsors/camel_logo.png" alt="CaMeL" width="120"></a></td>
-<td>Thanks to CaMeL for sponsoring this project! In-depth cooperation with major research institutes and supercomputing centers, self-developed high-stability high-efficiency cache scheduling solution. Exclusive for cc-connect users: New registration authentication immediately receive $10 credit upon registration. Register via <a href="https://camel.kr777.top/register?aff=V2z8">this link</a>.</td>
+<td width="150"><a href="https://unity2.ai/register?source=ccconnect"><img src="assets/sponsors/unity2ai.png" alt="Unity2.ai" width="120"></a></td>
+<td>Thanks to Unity2.ai for sponsoring this project! Unity2.ai is a high-performance AI model API relay platform for individual developers, teams, and enterprises. Long-term service for top domestic enterprises, daily traffic exceeding 30 billion tokens, supporting up to 5000 RPM high concurrency. Offers balance billing, first-top-up bonus, combo subscriptions, enterprise invoicing, and dedicated integration. Register via <a href="https://unity2.ai/register?source=ccconnect">this link</a> to claim $2 credit, join the official group for an additional $10 credit — up to $12 in free credits!</td>
+</tr>
+
+<tr>
+<td width="150"><a href="https://ergouapi.com/r/gh-cc-connect"><img src="assets/sponsors/ergou.png" alt="二狗 API" width="120"></a></td>
+<td>Thanks to Ergou API (二狗 API) for sponsoring this project! Ergou API is an LLM API relay offering industry-low 0.1x-0.2x rates across the board, with 100% native endpoints for Claude, GPT, Gemini and other top-tier LLMs. Backed by premium IPLC routes plus dual residential ISP redundancy, Ergou API delivers stable, low-latency access nationwide. Developers and studios are welcome to <a href="https://ergouapi.com/r/gh-cc-connect">sign up</a>.</td>
 </tr>
 
 <tr>
@@ -137,16 +155,6 @@ MiniMax-M3 pushes the frontier of coding and agentic AI, with a 1M-token context
 <td>Thanks to DragonCode for supporting this project. DragonCode has prepared a special benefit for cc-connect users: register via <a href="https://dragoncode.codes/register?ref=23ZELCPX">this link</a> to get started.</td>
 </tr>
 
-<tr>
-<td width="150"><a href="https://coder.visioncoder.cn"><img src="assets/sponsors/visioncoder.png" alt="VisionCoder" width="120"></a></td>
-<td>Thanks to VisionCoder for supporting this project. <a href="https://coder.visioncoder.cn">VisionCoder Developer Platform</a> is a reliable and efficient API relay service provider, offering access to mainstream AI models such as Claude Code, Codex, and Gemini. It helps developers and teams integrate AI capabilities more easily and improve productivity. VisionCoder is also offering our users a limited-time <a href="https://coder.visioncoder.cn">Token Plan</a> promotion: buy 1 month and get 1 month free.</td>
-</tr>
-
-
-<tr>
-<td width="150"><a href="https://ddshub.short.gy/ccconnect"><img src="assets/sponsors/ddshub.png" alt="DDS Hub" width="120"></a></td>
-<td>Thanks to DDS for sponsoring this project! DDS Hub is a reliable and high-performance Claude and CodeX API proxy service. We provides cost-effective domestic Claude direct acceleration services for both individual and enterprise users. We offer stable and low-latency Claude Max number pools, with full support for Claude Haiku, Opus, Sonnet, GPT 5.4 and other flagship models. Invoices are available for recharges of 1000 RMB or more. Enterprise customers can also enjoy customized grouping and dedicated technical support services. Exclusive benefit for CC connect users: Register via <a href="https://ddshub.short.gy/ccconnect">this link</a> and enjoy an extra 10% credit on your first recharge (please contact the group admin to claim after recharging)!</td>
-</tr>
 
 <tr>
 <td width="150"><a href="https://code0.ai/register?aff=5cGO"><img src="assets/sponsors/code0.svg" alt="Code0" width="120"></a></td>
@@ -543,6 +551,7 @@ Notes:
 - `--image` and `--file` can both be repeated.
 - `--tts` sends synthesized speech when the user asks for a voice reply.
 - `attachment_send = "off"` disables only attachment send-back; ordinary text replies still work.
+- Attachments are capped at 50 MiB by default; configure with `max_attachment_size_mb` (or `CC_MAX_ATTACHMENT_SIZE_MB` env, same MiB unit).
 - This command is for generated attachments, not ordinary text replies.
 
 📖 **Full documentation:** [docs/usage.md](docs/usage.md)

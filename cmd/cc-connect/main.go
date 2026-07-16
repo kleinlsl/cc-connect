@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -28,6 +29,11 @@ var (
 	commit    = "none"
 	buildTime = "unknown"
 )
+
+// globalAPIServer holds the running API server so the config-reload path can
+// re-apply hot-reloadable settings (e.g. max attachment size) without threading
+// it through the engine's reload closure. nil when the API server is disabled.
+var globalAPIServer *core.APIServer
 
 // defaultResetOnIdleMins is applied when a project does not set
 // reset_on_idle_mins. After this many minutes of user inactivity, cc-connect
@@ -164,6 +170,27 @@ func preScanLogMaxBackupsFlag(args []string) string {
 	return ""
 }
 
+// resolveMaxAttachmentSize returns the per-attachment size limit in bytes for
+// the /send API. Priority: CC_MAX_ATTACHMENT_SIZE_MB env var (MiB) >
+// config max_attachment_size_mb > core.DefaultMaxAttachmentSize. The env var
+// intentionally uses the same MiB unit as the config field so the two knobs
+// cannot silently disagree by a factor of 1<<20. A malformed or non-positive
+// env value is ignored (falling through to config/default) rather than being
+// fatal — the same lenient posture as resolveLogMaxSize, which also warns so
+// a typo never silently downgrades the setting.
+func resolveMaxAttachmentSize(cfg *config.Config) int64 {
+	if v := strings.TrimSpace(os.Getenv("CC_MAX_ATTACHMENT_SIZE_MB")); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			return n << 20
+		}
+		fmt.Fprintf(os.Stderr, "warning: ignoring CC_MAX_ATTACHMENT_SIZE_MB=%q: must be a positive integer (MiB)\n", v)
+	}
+	if cfg != nil && cfg.MaxAttachmentSizeMB > 0 {
+		return int64(cfg.MaxAttachmentSizeMB) << 20
+	}
+	return core.DefaultMaxAttachmentSize
+}
+
 type initialModelRefreshStarter interface {
 	StartInitialModelRefresh()
 }
@@ -221,6 +248,9 @@ func main() {
 			return
 		case "weixin":
 			runWeixin(os.Args[2:])
+			return
+		case "yuanbao":
+			runYuanbao(os.Args[2:])
 			return
 		case "doctor":
 			runDoctor(os.Args[2:])
@@ -407,7 +437,7 @@ func main() {
 		engine := core.NewEngine(proj.Name, agent, platforms, sessionFile, lang)
 		// Wire display settings including show_context_indicator and reply_footer
 		// Global [display] config can be overridden by project-level settings
-		_, _, _, _, _, showCtx, showFooter := config.EffectiveDisplay(cfg, &proj)
+		_, _, _, _, _, showCtx, showFooter, _ := config.EffectiveDisplay(cfg, &proj)
 		engine.SetShowContextIndicator(showCtx)
 		showWorkdir := true
 		if proj.ShowWorkdirIndicator != nil {
@@ -537,7 +567,8 @@ func main() {
 
 		// Wire display truncation settings (includes legacy quiet → display mapping)
 		{
-			mode, tm, tool, tmlen, toollen, _, _ := config.EffectiveDisplay(cfg, &proj)
+			mode, tm, tool, tmlen, toollen, _, _, hideAgentFooter := config.EffectiveDisplay(cfg, &proj)
+			historyMaxLen := config.EffectiveHistoryMaxLen(cfg, &proj)
 			engine.SetDisplayConfig(core.DisplayCfg{
 				Mode:             mode,
 				CardMode:         config.EffectiveCardMode(cfg, &proj),
@@ -545,6 +576,8 @@ func main() {
 				ThinkingMaxLen:   tmlen,
 				ToolMaxLen:       toollen,
 				ToolMessages:     tool,
+				HistoryMaxLen:    &historyMaxLen,
+				HideAgentFooter:  hideAgentFooter,
 			})
 		}
 
@@ -692,6 +725,14 @@ func main() {
 		if defaulted {
 			slog.Info("project: reset_on_idle_mins not set, applying default — set reset_on_idle_mins = 0 to opt out, see docs/usage.md",
 				"project", proj.Name, "default_minutes", defaultResetOnIdleMins)
+		}
+		if proj.AgentSessionIdleTimeoutMins != nil {
+			mins := *proj.AgentSessionIdleTimeoutMins
+			if mins <= 0 {
+				engine.SetAgentSessionIdleTimeout(0)
+			} else {
+				engine.SetAgentSessionIdleTimeout(time.Duration(mins) * time.Minute)
+			}
 		}
 
 		// Wire sender injection
@@ -1235,6 +1276,9 @@ func main() {
 	if err != nil {
 		slog.Warn("api server unavailable", "error", err)
 	} else {
+		globalAPIServer = apiSrv
+		apiSrv.SetMaxAttachmentSize(resolveMaxAttachmentSize(cfg))
+
 		relayMgr := core.NewRelayManager(cfg.DataDir)
 		if cfg.Relay.TimeoutSecs != nil {
 			secs := *cfg.Relay.TimeoutSecs
@@ -1273,11 +1317,15 @@ func main() {
 
 	slog.Info("cc-connect is running", "projects", len(engines))
 
-	// After startup, check if we were restarted and send success notification
+	// After startup, check if we were restarted and queue the success
+	// notification. The engine dispatches it on the first OnPlatformReady
+	// for the target platform (or with a 10s safety timeout), so async
+	// platforms that need 2-3s to actually connect (e.g. Telegram) do not
+	// silently drop the notify. See issue #1383.
 	if notify := core.ConsumeRestartNotify(cfg.DataDir); notify != nil {
-		slog.Info("post-restart: sending success notification", "platform", notify.Platform, "session", notify.SessionKey)
+		slog.Info("post-restart: queuing success notification", "platform", notify.Platform, "session", notify.SessionKey)
 		for _, e := range engines {
-			e.SendRestartNotification(notify.Platform, notify.SessionKey)
+			e.SetPendingRestartNotify(notify)
 		}
 	}
 
@@ -1596,6 +1644,7 @@ Examples:
   cc-connect cron list                List all scheduled tasks
   cc-connect feishu setup             Setup Feishu/Lark bot credentials
   cc-connect weixin setup             Setup Weixin (ilink) with QR or --token
+  cc-connect yuanbao setup            Setup Yuanbao bot with --token app_key:app_secret
   cc-connect update                   Update to the latest version
   cc-connect config format            Format the config file
   cc-connect config example > c.toml  Save example config to a file
@@ -1633,6 +1682,11 @@ func reloadConfig(configPath, projName string, engine *core.Engine) (*core.Confi
 
 	result := &core.ConfigReloadResult{}
 
+	// Re-apply process-global hot-reloadable settings.
+	if globalAPIServer != nil {
+		globalAPIServer.SetMaxAttachmentSize(resolveMaxAttachmentSize(cfg))
+	}
+
 	// Find the matching project
 	var proj *config.ProjectConfig
 	for i := range cfg.Projects {
@@ -1646,7 +1700,8 @@ func reloadConfig(configPath, projName string, engine *core.Engine) (*core.Confi
 	}
 
 	// Reload display config (includes legacy quiet → display mapping)
-	mode, tm, tool, tmlen, toollen, showCtx, showFooter := config.EffectiveDisplay(cfg, proj)
+	mode, tm, tool, tmlen, toollen, showCtx, showFooter, hideAgentFooter := config.EffectiveDisplay(cfg, proj)
+	historyMaxLen := config.EffectiveHistoryMaxLen(cfg, proj)
 	engine.SetDisplayConfig(core.DisplayCfg{
 		Mode:             mode,
 		CardMode:         config.EffectiveCardMode(cfg, proj),
@@ -1654,6 +1709,8 @@ func reloadConfig(configPath, projName string, engine *core.Engine) (*core.Confi
 		ThinkingMaxLen:   tmlen,
 		ToolMaxLen:       toollen,
 		ToolMessages:     tool,
+		HistoryMaxLen:    &historyMaxLen,
+		HideAgentFooter:  hideAgentFooter,
 	})
 	result.DisplayUpdated = true
 
@@ -1685,6 +1742,18 @@ func reloadConfig(configPath, projName string, engine *core.Engine) (*core.Confi
 	if defaulted {
 		slog.Info("project: reset_on_idle_mins not set, applying default — set reset_on_idle_mins = 0 to opt out, see docs/usage.md",
 			"project", proj.Name, "default_minutes", defaultResetOnIdleMins)
+	}
+	if proj.AgentSessionIdleTimeoutMins != nil {
+		mins := *proj.AgentSessionIdleTimeoutMins
+		if mins <= 0 {
+			engine.SetAgentSessionIdleTimeout(0)
+		} else {
+			engine.SetAgentSessionIdleTimeout(time.Duration(mins) * time.Minute)
+		}
+	} else {
+		// A reload may remove this option after timers were scheduled; reset
+		// explicitly so those stale idle-close timers cannot fire later.
+		engine.SetAgentSessionIdleTimeout(0)
 	}
 
 	// Reload instant reply
