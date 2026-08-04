@@ -3813,6 +3813,12 @@ type feishuPreviewHandle struct {
 	sequence    int    // cardkit-v1 streaming text monotonic counter (++ before use; first call = 1)
 	status      core.CardStatus
 	lastContent string
+
+	// lastCardBody / lastCardFooter cache the last (body, footer) pair rendered
+	// via UpdateMessageWithStatusFooter so an identical repeat can be skipped.
+	// See UpdateMessageWithStatusFooter idempotency guard.
+	lastCardBody   string
+	lastCardFooter string
 }
 
 // buildCardJSON builds a Feishu interactive card JSON string with a markdown element.
@@ -4621,11 +4627,29 @@ func (p *Platform) UpdateMessageWithStatusFooter(ctx context.Context, previewHan
 	// resolve since the matching Send path resolves on the chat-thread API.
 	processedBody := sanitizeMarkdownURLs(preprocessFeishuMarkdown(content))
 	processedFooter := sanitizeMarkdownURLs(preprocessFeishuMarkdown(footer))
-	cardJSON := buildCardJSONWithStatusFooter(processedBody, processedFooter)
-	// Same card-entity routing as UpdateMessage above.
+
+	// Idempotency guard: if the exact same (body, footer) pair was already
+	// rendered to this preview card, skip the redundant Patch. The streaming
+	// preview already delivered the final body via UpdateMessage; the only
+	// remaining work is appending the footer. When the body hasn't changed
+	// since that last render, re-patching the identical card makes Feishu
+	// re-render the footer element, which the UI shows as a duplicate
+	// status-footer line (the "double-print" symptom). Tracking the last
+	// rendered pair and short-circuiting identical updates fixes it while
+	// keeping the status footer visible.
 	h.mu.Lock()
+	lastBody, lastFooter := h.lastCardBody, h.lastCardFooter
+	h.lastCardBody = processedBody
+	h.lastCardFooter = processedFooter
 	cardID := h.cardID
 	h.mu.Unlock()
+	if processedBody == lastBody && processedFooter == lastFooter {
+		slog.Debug("feishu: UpdateMessageWithStatusFooter skipped (body+footer unchanged)",
+			"body_len", len(processedBody), "footer_len", len(processedFooter))
+		return nil
+	}
+	cardJSON := buildCardJSONWithStatusFooter(processedBody, processedFooter)
+	// Same card-entity routing as UpdateMessage above.
 	if cardID != "" {
 		return p.updateCardEntity(ctx, h, cardJSON)
 	}

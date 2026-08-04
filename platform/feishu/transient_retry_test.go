@@ -418,6 +418,77 @@ func TestPatchMessageRetriesOnTransientError(t *testing.T) {
 	}
 }
 
+// ─── Test: UpdateMessageWithStatusFooter idempotency guard ──────────────────
+
+func TestUpdateMessageWithStatusFooter_Idempotent(t *testing.T) {
+	const appID = "cli_footer_idem"
+	const appSecret = "secret"
+
+	var patchCalls atomic.Int32
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/open-apis/auth/v3/tenant_access_token/internal":
+			writeJSON(t, w, map[string]any{
+				"code":                0,
+				"msg":                 "success",
+				"expire":              7200,
+				"tenant_access_token": "valid-token",
+			})
+		case strings.Contains(r.URL.Path, "/messages/") && r.Method == http.MethodPatch:
+			patchCalls.Add(1)
+			writeJSON(t, w, map[string]any{"code": 0, "msg": "success"})
+		default:
+			json.NewEncoder(w).Encode(map[string]any{"code": 0, "msg": "ok"})
+		}
+	}))
+	defer srv.Close()
+
+	p := &Platform{
+		platformName:       "feishu",
+		domain:             srv.URL,
+		appID:              appID,
+		appSecret:          appSecret,
+		useInteractiveCard: true,
+		client: lark.NewClient(appID, appSecret,
+			lark.WithOpenBaseUrl(srv.URL),
+			lark.WithHttpClient(srv.Client()),
+		),
+		replayClient: lark.NewClient(appID, appSecret,
+			lark.WithEnableTokenCache(false),
+			lark.WithOpenBaseUrl(srv.URL),
+			lark.WithHttpClient(srv.Client()),
+		),
+	}
+
+	h := &feishuPreviewHandle{messageID: "om_footer_1", chatID: "oc_chat"}
+
+	// First call renders the card: one Patch.
+	body, footer := "Hello World", "model · ctx 5%\n~/path"
+	if err := p.UpdateMessageWithStatusFooter(context.Background(), h, body, footer); err != nil {
+		t.Fatalf("UpdateMessageWithStatusFooter (first) error = %v", err)
+	}
+
+	// Identical repeat: idempotency guard must skip the Patch entirely.
+	if err := p.UpdateMessageWithStatusFooter(context.Background(), h, body, footer); err != nil {
+		t.Fatalf("UpdateMessageWithStatusFooter (dup) error = %v", err)
+	}
+
+	if got := patchCalls.Load(); got != 1 {
+		t.Fatalf("patchCalls = %d, want 1 (identical repeat must be skipped)", got)
+	}
+
+	// A changed body still renders: second Patch.
+	newBody := "Hello World v2"
+	if err := p.UpdateMessageWithStatusFooter(context.Background(), h, newBody, footer); err != nil {
+		t.Fatalf("UpdateMessageWithStatusFooter (changed) error = %v", err)
+	}
+	if got := patchCalls.Load(); got != 2 {
+		t.Fatalf("patchCalls = %d, want 2 (changed body must render)", got)
+	}
+}
+
 // ─── Test: transient retry + token refresh work together ───────────────────
 
 func TestReplyTransientRetryThenTokenRefresh(t *testing.T) {
