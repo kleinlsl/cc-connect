@@ -2711,3 +2711,70 @@ func TestCmdAction_WithAfterClick_SessionKeyRoutes(t *testing.T) {
 		t.Fatal("expected command to be dispatched with correct session key")
 	}
 }
+
+func TestInteractivePlatform_CardActionP2PAllowedViaAllowP2PFrom(t *testing.T) {
+	// Regression: a p2p (single-chat) card action must pass when the chat is not
+	// in allow_chat but the operator is in allow_p2p_from under group_only=true.
+	// Previously onCardAction used only allow_chat, so single-chat /help buttons
+	// (chat id not in the group allow_chat list) were silently dropped.
+	platformAny, err := New(map[string]any{
+		"app_id":             "cli_xxx",
+		"app_secret":         "secret",
+		"enable_feishu_card": true,
+		"group_only":         true,
+		"allow_p2p_from":     "ou_whitelisted_user",
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	ip, ok := platformAny.(*interactivePlatform)
+	if !ok {
+		t.Fatalf("platform type = %T, want *interactivePlatform", platformAny)
+	}
+
+	actionCh := make(chan string, 1)
+	ip.cardNavHandler = func(action string, sessionKey string) *core.Card {
+		actionCh <- action
+		return core.NewCard().Markdown("ok").Build()
+	}
+
+	// p2p chat id (single-user chat) not in allow_chat, but operator whitelisted.
+	_, err = ip.onCardAction(&callback.CardActionTriggerEvent{
+		Event: &callback.CardActionTriggerRequest{
+			Operator: &callback.Operator{OpenID: "ou_whitelisted_user"},
+			Action:   &callback.CallBackAction{Value: map[string]any{"action": "nav:/help"}},
+			// A p2p chat with a user still has an OpenChatID like any chat.
+			Context: &callback.Context{OpenChatID: "oc_p2p_whitelisted", OpenMessageID: "om_msg1"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("onCardAction() (whitelisted p2p) error = %v", err)
+	}
+	select {
+	case got := <-actionCh:
+		if got != "nav:/help" {
+			t.Fatalf("action = %q, want nav:/help", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected whitelisted p2p card action to reach nav handler")
+	}
+
+	// Non-whitelisted operator in a chat not in allow_chat must be dropped.
+	ip.cardNavHandler = nil // fail loudly if called again
+	_, err = ip.onCardAction(&callback.CardActionTriggerEvent{
+		Event: &callback.CardActionTriggerRequest{
+			Operator: &callback.Operator{OpenID: "ou_unlisted_user"},
+			Action:   &callback.CallBackAction{Value: map[string]any{"action": "nav:/help"}},
+			Context:  &callback.Context{OpenChatID: "oc_unlisted_chat", OpenMessageID: "om_msg2"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("onCardAction() (unlisted) error = %v", err)
+	}
+	select {
+	case got := <-actionCh:
+		t.Fatalf("unlisted card action should have been dropped, got %q", got)
+	default:
+		// expected: no nav handler invocation
+	}
+}

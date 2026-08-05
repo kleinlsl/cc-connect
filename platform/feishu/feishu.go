@@ -696,9 +696,18 @@ func (p *Platform) onCardAction(event *callback.CardActionTriggerEvent) (*callba
 		return nil, nil
 	}
 
-	// Check allow_chat filter: skip card actions from chats this platform doesn't own.
-	if event.Event.Context != nil && event.Event.Context.OpenChatID != "" {
-		if !core.AllowList(p.allowChat, event.Event.Context.OpenChatID) {
+	// Check allow_chat / allow_p2p_from, mirroring the inbound message path
+	// (handleIncomingMessage): group chats must be in allow_chat; p2p chats pass
+	// when group_only is off or the operator is in allow_p2p_from. Skipping
+	// unowned chats lets sibling platforms sharing the WebSocket keep their own
+	// card callbacks.
+	if event.Event.Context != nil && event.Event.Context.OpenChatID != "" &&
+		!core.AllowList(p.allowChat, event.Event.Context.OpenChatID) {
+		op := ""
+		if event.Event.Operator != nil {
+			op = event.Event.Operator.OpenID
+		}
+		if p.groupOnly && !core.AllowList(p.allowP2PFrom, op) {
 			return nil, nil
 		}
 	}
