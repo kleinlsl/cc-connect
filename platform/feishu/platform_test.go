@@ -548,6 +548,12 @@ func TestInteractivePlatform_CardActionUsesCallbackSessionKey(t *testing.T) {
 		if msg.SessionKey != wantSessionKey {
 			t.Fatalf("SessionKey = %q, want %q", msg.SessionKey, wantSessionKey)
 		}
+		if msg.ChannelKey != "oc_test_chat:topic:om_root_thread" {
+			t.Fatalf("ChannelKey = %q, want oc_test_chat:topic:om_root_thread", msg.ChannelKey)
+		}
+		if msg.LegacyChannelKey != "oc_test_chat" {
+			t.Fatalf("LegacyChannelKey = %q, want oc_test_chat", msg.LegacyChannelKey)
+		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("expected card action message")
 	}
@@ -730,6 +736,12 @@ func TestLark_SessionKeyPrefix(t *testing.T) {
 	if receivedMsg.Platform != "lark" {
 		t.Fatalf("Platform = %q, want lark", receivedMsg.Platform)
 	}
+	if receivedMsg.ChannelKey != "oc_test" {
+		t.Fatalf("ChannelKey = %q, want oc_test", receivedMsg.ChannelKey)
+	}
+	if receivedMsg.LegacyChannelKey != "" {
+		t.Fatalf("LegacyChannelKey = %q, want empty outside topic mode", receivedMsg.LegacyChannelKey)
+	}
 }
 
 func TestLark_ThreadIsolationUsesRootSessionKey(t *testing.T) {
@@ -790,6 +802,12 @@ func TestLark_ThreadIsolationUsesRootSessionKey(t *testing.T) {
 	}
 	if receivedMsg.SessionKey != "lark:oc_test:root:om_root" {
 		t.Fatalf("SessionKey = %q, want lark:oc_test:root:om_root", receivedMsg.SessionKey)
+	}
+	if receivedMsg.ChannelKey != "oc_test:topic:om_root" {
+		t.Fatalf("ChannelKey = %q, want oc_test:topic:om_root", receivedMsg.ChannelKey)
+	}
+	if receivedMsg.LegacyChannelKey != "oc_test" {
+		t.Fatalf("LegacyChannelKey = %q, want oc_test", receivedMsg.LegacyChannelKey)
 	}
 }
 
@@ -985,6 +1003,12 @@ func TestLark_GroupReplyAllWithThreadIsolationUsesRootSessionKeyWithoutMention(t
 	case receivedMsg := <-msgCh:
 		if receivedMsg.SessionKey != "lark:oc_test:root:om_root" {
 			t.Fatalf("SessionKey = %q, want lark:oc_test:root:om_root", receivedMsg.SessionKey)
+		}
+		if receivedMsg.ChannelKey != "oc_test:topic:om_root" {
+			t.Fatalf("ChannelKey = %q, want oc_test:topic:om_root", receivedMsg.ChannelKey)
+		}
+		if receivedMsg.LegacyChannelKey != "oc_test" {
+			t.Fatalf("LegacyChannelKey = %q, want oc_test", receivedMsg.LegacyChannelKey)
 		}
 		rc, ok := receivedMsg.ReplyCtx.(replyContext)
 		if !ok {
