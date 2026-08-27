@@ -153,6 +153,43 @@ func (p *Platform) dispatchMessage(ctx, msgType, content string, mentions,
 | `TestLark_GroupReplyAll...` | ack 打到真实 API | 新增完整 mock server |
 | `TestAllowChat_FiltersGroupMessages` | 同上 | 新增完整 mock server |
 
+### 4.4 第二次合并（v1.5.0 → 2026-08-27，38 commits）
+
+**分支：** `sync-upstream-0827`（基于 `sync-upstream-0805`）
+
+**冲突文件：** `platform/feishu/feishu.go`（6 处冲突）
+
+| # | 冲突位置 | 我们的分支 | 上游 | 解决方式 |
+|---|---------|-----------|------|---------|
+| 1 | `replyContext`/`replyResult` 结构体 | `threadID`+`replyInThread`+`replyResult` | `bootstrapThread` | 合并两者，保留全部字段 |
+| 2 | quote 注入条件 | `threadID == ""` 简单判断 | `bootstrapThread` 精细控制 | 采用上游 |
+| 3 | `quotedParent` 结构体 | 基础字段 | +`senderID`/`files`/`parentID`/`quotedFileMeta` | 采用上游 |
+| 4 | `fetchQuotedMessage` 注释 | 只取直接父消息 | 多级 reply chain | 采用上游 |
+| 5 | `fetchQuotedMessage` 返回值 | 简单格式化 | chain 格式化+文件收集 | 采用上游 |
+| 6 | `formatQuotedParent` vs chain 函数 | 单消息格式化 | 多级 chain 函数集 | 采用上游 |
+
+**额外修复：**
+
+| 问题 | 修复 |
+|------|------|
+| `daemon/check_linger_other.go` 与 `launchd.go` 重复声明 `CheckLinger` | build tag 改为 `!linux && !darwin` |
+| `chainMessage` 类型和 `maxReplyChainDepth` 常量缺失 | 添加类型别名和常量 |
+| `fetchSingleMessage` 响应结构体缺少 `ParentID` | 添加字段 |
+| 3 个测试因 ack reply 未 mock 失败 | mock server 添加 `/reply` 路径 |
+| `TestDispatchMessageKeepsMentionOnlyQuotedText` 期望单级 parent | mock 改为 `parent_id: ""` |
+
+**上游新增功能：**
+- Google Chat 平台适配器
+- Kimi Code CLI 原生支持
+- Antigravity Agent 工具权限桥接
+- admin_from 权限控制（/commands addexec, /cron addexec）
+- 飞书引用文件按需下载（issue #1560）
+- 多级 reply chain quote 注入
+- sonnet[1m] 回退模型
+- i18n 本地化（cron/timer/send/relay）
+
+**对我们自定义功能的影响：** 无破坏性冲突。Thread 隔离、ACK、allow_p2p_from、threadIDAliases 均不受影响。Quote 注入从单级变为多级 reply chain（功能增强）。
+
 ---
 
 ## 5. 编译与运行
@@ -229,7 +266,7 @@ launchctl load ~/Library/LaunchAgents/com.cc-connect.service.plist
 
 **分支名：** `feat/card-message-and-thread-session`
 
-**基于：** upstream/main (v1.5.0) + 自定义魔改
+**基于：** upstream/main (2026-08-27) + 自定义魔改
 
 ### 6.1 核心功能
 
@@ -320,7 +357,7 @@ git checkout main && git merge upstream/main && git push origin main
 
 # ========== 合并到开发分支 ==========
 git checkout feat/card-message-and-thread-session
-git merge upstream/main
+git merge sync-upstream-0827
 # 解决冲突后：
 git add -A && git commit -m "merge: 合并 upstream/main"
 git push origin feat/card-message-and-thread-session
