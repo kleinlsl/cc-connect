@@ -2701,7 +2701,8 @@ func (p *Platform) SendWithStatusFooter(ctx context.Context, rctx any, content, 
 	if strings.TrimSpace(footer) == "" {
 		return p.Send(ctx, rctx, content)
 	}
-	content += "\n\n" + footer
+	// Don't append footer to content here — buildCardJSONWithStatusFooter
+	// renders it as a separate "notation"-sized element below an <hr>.
 	processedBody := sanitizeMarkdownURLs(preprocessFeishuMarkdown(content))
 	processedFooter := sanitizeMarkdownURLs(preprocessFeishuMarkdown(footer))
 	cardJSON := buildCardJSONWithStatusFooter(processedBody, processedFooter)
