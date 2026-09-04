@@ -219,11 +219,22 @@ func (s *acpSession) handshake(resumeSessionID string, authMethod string) error 
 				SessionID string         `json:"sessionId"`
 				Modes     *acpModesBlock `json:"modes"`
 			}
-			if json.Unmarshal(loadRes, &lr) == nil && lr.SessionID != "" {
-				s.setACPSessionID(lr.SessionID)
+			// Per the ACP spec, LoadSessionResponse carries NO sessionId — the
+			// loaded session is the one we requested. Some non-standard agents may
+			// echo one anyway, so prefer it when present and otherwise keep the
+			// requested resumeSessionID. Previously this required a non-empty
+			// response sessionId and therefore silently fell through to
+			// session/new on every spec-compliant agent (Hermes), orphaning the
+			// session the agent had just restored.
+			loadedID := resumeSessionID
+			if json.Unmarshal(loadRes, &lr) == nil {
 				s.absorbModes(lr.Modes)
-				return nil
+				if lr.SessionID != "" {
+					loadedID = lr.SessionID
+				}
 			}
+			s.setACPSessionID(loadedID)
+			return nil
 		}
 	}
 
