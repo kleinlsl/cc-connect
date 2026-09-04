@@ -150,6 +150,6 @@ Desktop.ini
 *.pfx
 secrets/
 credentials/
-
+.omc/
 .codex
 cc-connect-new
