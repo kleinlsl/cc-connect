@@ -231,8 +231,11 @@ func extractToolCallContentText(blocks []struct {
 // that still carry human-readable text). Never guesses auth or tool semantics.
 func mapSessionUpdateFallback(sessionID string, kind string, update json.RawMessage) []core.Event {
 	// Some agents may send reasoning as a dedicated discriminator; map to EventThinking.
+	// NOTE: Hermes emits "agent_thought_chunk" (thought, not "thinking"); both spellings
+	// must be recognized or the thought text falls through to the generic-text fallback
+	// and gets delivered to IM as a normal answer — bypassing the thinking_messages switch.
 	switch strings.ToLower(kind) {
-	case "reasoning", "reasoning_chunk", "thinking", "agent_thinking_chunk":
+	case "reasoning", "reasoning_chunk", "thinking", "agent_thinking_chunk", "agent_thought_chunk", "thought", "thought_chunk":
 		var u struct {
 			Content struct {
 				Type string `json:"type"`

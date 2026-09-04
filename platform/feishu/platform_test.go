@@ -1075,7 +1075,7 @@ func TestFeishu_HybridGroupStartCreatesThreadSessionBeforeDispatch(t *testing.T)
 		appID:              appID,
 		appSecret:          appSecret,
 		sessionKeyStrategy: "hybrid",
-		dedup:           &core.MessageDedup{},
+		dedup:              &core.MessageDedup{},
 		client: lark.NewClient(appID, appSecret,
 			lark.WithOpenBaseUrl(srv.URL),
 			lark.WithHttpClient(srv.Client()),
@@ -1144,8 +1144,15 @@ func TestFeishu_HybridGroupStartCreatesThreadSessionBeforeDispatch(t *testing.T)
 		t.Fatalf("reply_in_thread = %v, want true", replyBodies[0]["reply_in_thread"])
 	}
 	content, _ = replyBodies[0]["content"].(string)
-	if !strings.Contains(content, "[session: feishu:oc_alerts:thread:om_start]") {
-		t.Fatalf("ack content = %q, want temporary thread session key", content)
+	// A fresh-topic ack must NOT carry the temporary om_ session key: the real omt_
+	// topic id exists only after this ack is sent, and a plain-text ack cannot be
+	// edited afterwards (Feishu PATCH only works on cards). The footer is hidden
+	// until the key already is the real omt_ id (follow-ups inside the topic).
+	if strings.Contains(content, "[session:") {
+		t.Fatalf("fresh-topic ack must hide the temporary session key, got %q", content)
+	}
+	if !strings.Contains(content, "收到报警，正在排查中...") {
+		t.Fatalf("ack content = %q, want ack text", content)
 	}
 	if _, ok := p.ackThrottle.Load("feishu:oc_alerts:thread:omt_real_thread"); !ok {
 		t.Fatal("ack throttle missing real thread session key")

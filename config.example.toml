@@ -1030,6 +1030,10 @@ app_secret = "your-feishu-app-secret"
 #                           # 设为 true 时，群聊按飞书话题/根消息隔离会话；multi-workspace 模式下每个话题也独立绑定 workspace
 # session_key_strategy = "hybrid" # Recommended for alert/group workflows: group messages use thread sessions; private chats use user sessions.
 #                                 # 推荐用于群告警/多任务场景：群聊按话题隔离会话，私聊按用户隔离；首次 ack 会以 reply_in_thread=true 触发飞书话题。
+# echo_quoted_in_thread = false # When session_key_strategy=thread and a message quotes a parent, echo the quoted content once into the newly created topic so it is self-contained (default false)
+#                               # thread 策略下，引用消息触发新话题时，把被引用原文在话题内回显一次，方便在话题内直接对照（默认 false）
+# card_requires_mention = false # By default interactive (card) messages in a group are handled without @mention. Set true to require @mention for cards too (everything then needs an @mention)
+#                               # 默认群里的卡片(interactive)消息无需 @ 即处理；设为 true 后卡片也必须 @机器人（即一切消息都要 @）
 # reply_to_trigger = true   # Default: bot uses “reply to message” API (quotes the user’s message). Set false to post plain chat messages instead.
 #                           # 默认 true：用「回复消息」API（引用用户消息）。设为 false 则在会话里发普通消息、不引用触发消息。
 # progress_style = "legacy" # Progress rendering style: legacy | compact | card

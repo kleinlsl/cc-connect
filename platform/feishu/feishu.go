@@ -138,6 +138,13 @@ type Platform struct {
 	respondToAtEveryoneAndHere bool
 	shareSessionInChannel      bool
 	threadIsolation            bool
+	// cardRequiresMention: when true, interactive (card) messages in a group must
+	// @mention the bot just like plain text — disables the default card auto-pass.
+	cardRequiresMention bool
+	// echoQuotedInThread: when true, a freshly created thread echoes the quoted
+	// parent content once, so the topic is self-contained and the human reader
+	// does not have to jump out to the original (often off-topic) message.
+	echoQuotedInThread bool
 	// noReplyToTrigger: when true, send via Create instead of Im.Message.Reply (no quote to the user's message).
 	noReplyToTrigger bool
 	resolveMentions  bool
@@ -157,18 +164,18 @@ type Platform struct {
 	// Issue #1618: previous behavior treated botOpenID=="" as "filter off", which
 	// silently turned the bot into a loud responder for the rest of the process
 	// lifetime when the bot-info API failed.
-	groupFilterDegraded     bool
-	groupFilterDegradedAt   time.Time
-	groupFilterDegradedErr  string
-	groupFilterRetryCancel  context.CancelFunc
-	groupFilterRetryStop    chan struct{}
-	peerBots                map[string]string // app_id -> friendly alias, for quoted-reply attribution
-	mentionMap       map[string]string // agent name -> open_id (for outbound @ resolution)
-	userNameCache    sync.Map          // open_id -> display name
-	chatNameCache    sync.Map          // chat_id -> chat name
-	chatMemberCache  sync.Map          // chatID -> *chatMemberEntry
-	recalledMu       sync.Mutex
-	recalledMsgIDs   map[string]time.Time // message_id -> recall time, short TTL race guard
+	groupFilterDegraded    bool
+	groupFilterDegradedAt  time.Time
+	groupFilterDegradedErr string
+	groupFilterRetryCancel context.CancelFunc
+	groupFilterRetryStop   chan struct{}
+	peerBots               map[string]string // app_id -> friendly alias, for quoted-reply attribution
+	mentionMap             map[string]string // agent name -> open_id (for outbound @ resolution)
+	userNameCache          sync.Map          // open_id -> display name
+	chatNameCache          sync.Map          // chat_id -> chat name
+	chatMemberCache        sync.Map          // chatID -> *chatMemberEntry
+	recalledMu             sync.Mutex
+	recalledMsgIDs         map[string]time.Time // message_id -> recall time, short TTL race guard
 	// Webhook mode fields (for Lark international version)
 	server       *http.Server
 	port         string
@@ -342,6 +349,8 @@ func newPlatform(name, domain string, opts map[string]any) (core.Platform, error
 	respondToAtEveryoneAndHere, _ := opts["respond_to_at_everyone_and_here"].(bool)
 	shareSessionInChannel, _ := opts["share_session_in_channel"].(bool)
 	threadIsolation, _ := opts["thread_isolation"].(bool)
+	cardRequiresMention, _ := opts["card_requires_mention"].(bool)
+	echoQuotedInThread, _ := opts["echo_quoted_in_thread"].(bool)
 	resolveMentionsOpt, _ := opts["resolve_mentions"].(bool)
 	noReplyToTrigger := false
 	if v, ok := opts["reply_to_trigger"].(bool); ok && !v {
@@ -447,6 +456,8 @@ func newPlatform(name, domain string, opts map[string]any) (core.Platform, error
 		respondToAtEveryoneAndHere: respondToAtEveryoneAndHere,
 		shareSessionInChannel:      shareSessionInChannel,
 		threadIsolation:            threadIsolation,
+		cardRequiresMention:        cardRequiresMention,
+		echoQuotedInThread:         echoQuotedInThread,
 		resolveMentions:            resolveMentionsOpt,
 		noReplyToTrigger:           noReplyToTrigger,
 		sessionKeyStrategy:         sessionKeyStrategy,
@@ -1185,6 +1196,15 @@ func (p *Platform) dispatchCoreMessage(msg *core.Message) {
 						ackResult.messageID,
 					)
 					p.ackThrottle.Store(newKey, time.Now())
+					// Optionally echo the quoted parent once into a FRESHLY created
+					// thread so the topic is self-contained (the quoted original
+					// usually sits outside the new topic). Only on thread creation:
+					// the temporary key's thread segment equals the trigger message
+					// id; an already-existing thread carries the real omt_ id instead.
+					isFreshThread := threadIDFromSessionKey(oldKey) == rc.messageID
+					if p.echoQuotedInThread && isFreshThread && strings.TrimSpace(msg.ExtraContent) != "" {
+						p.echoQuotedIntoThread(context.Background(), rc, msg.ExtraContent)
+					}
 					slog.Debug(p.tag()+": session key updated with real thread_id",
 						"old", oldKey, "new", newKey)
 				}
@@ -1251,7 +1271,13 @@ func (p *Platform) sendAckAndGetThreadID(ctx context.Context, content string, rc
 		return replyResult{}
 	}
 	ackText := p.buildAckText(content)
-	ackTextWithKey := fmt.Sprintf("%s\n[session: %s]", ackText, rctx.sessionKey)
+	// Under the thread strategy, the first message in a NEW topic has no topic id
+	// yet, so its session key is temporary (built from the trigger message id). The
+	// real omt_ topic id only exists AFTER this ack is sent, and Feishu's PATCH API
+	// cannot edit a plain-text ack (error 230001 "This message is NOT a card"). So
+	// suppress the [session:] footer on that fresh-topic ack; on follow-ups inside
+	// an existing topic the key already is the real omt_ id and the footer is shown.
+	ackTextWithKey := ackText + ackSessionFooter(rctx.sessionKey, rctx.messageID)
 	msgType, msgBody := buildReplyContent(ackTextWithKey)
 	result, err := p.replyMessage(ctx, rctx, msgType, msgBody)
 	if err != nil {
@@ -1260,6 +1286,75 @@ func (p *Platform) sendAckAndGetThreadID(ctx context.Context, content string, rc
 	}
 	p.ackThrottle.Store(rctx.sessionKey, time.Now())
 	return result
+}
+
+// ackSessionFooter renders the "\n[session: ..]" suffix appended to an ack. It
+// returns "" for the temporary fresh-topic session key (whose thread segment equals
+// the trigger message id): that id is replaced by the real omt_ topic id only after
+// the ack is sent, and a text ack cannot be edited afterwards — so showing it would
+// expose a stale om_ id that disagrees with the real session. Follow-up messages
+// inside an existing topic already carry the real omt_ id and get the footer.
+func ackSessionFooter(sessionKey, triggerMessageID string) string {
+	if sessionKey == "" {
+		return ""
+	}
+	if triggerMessageID != "" && threadIDFromSessionKey(sessionKey) == triggerMessageID {
+		return ""
+	}
+	return fmt.Sprintf("\n[session: %s]", sessionKey)
+}
+
+// quotedEchoMaxRunes caps how much quoted parent text is echoed into a freshly
+// created thread. Alert cards are typically 1-2 KB; this only guards against a
+// pathologically long quote.
+const quotedEchoMaxRunes = 4000
+
+// echoQuotedIntoThread posts the quoted parent content once into the thread that
+// was just created by the ack, so the topic is self-contained for human readers.
+// rc must already carry the real thread id and replyInThread=true.
+func (p *Platform) echoQuotedIntoThread(ctx context.Context, rc replyContext, extra string) {
+	body := formatQuotedEcho(extra)
+	if body == "" {
+		return
+	}
+	msgType, msgBody := buildReplyContent(body)
+	if _, err := p.replyMessage(ctx, rc, msgType, msgBody); err != nil {
+		slog.Warn(p.tag()+": echo quoted into thread failed", "error", err)
+	}
+}
+
+// formatQuotedEcho turns the agent-facing ExtraContent string (whose shape is
+// produced by formatReplyChain) into a human-readable note for the thread.
+func formatQuotedEcho(extra string) string {
+	s := strings.TrimSpace(extra)
+	if s == "" {
+		return ""
+	}
+	var body string
+	switch {
+	case strings.HasPrefix(s, "[Quoted message from "):
+		// Single quote: "[Quoted message from SENDER]:\nBODY"
+		if idx := strings.Index(s, "]:\n"); idx != -1 {
+			sender := strings.TrimSpace(strings.TrimPrefix(s[:idx], "[Quoted message from "))
+			rest := strings.TrimSpace(s[idx+len("]:\n"):])
+			if sender != "" {
+				body = "📎 引用内容（来自 " + sender + "）：\n" + rest
+			} else {
+				body = "📎 引用内容：\n" + rest
+			}
+		} else {
+			body = "📎 引用内容：\n" + s
+		}
+	case strings.HasPrefix(s, "--- Reply chain"):
+		body = "📎 引用消息链：\n" + s
+	default:
+		body = "📎 引用内容：\n" + s
+	}
+	r := []rune(body)
+	if len(r) > quotedEchoMaxRunes {
+		body = string(r[:quotedEchoMaxRunes]) + "\n…（引用内容过长，已截断）"
+	}
+	return body
 }
 
 // buildAckText determines the ack text based on message content
@@ -1310,6 +1405,7 @@ func (p *Platform) populateWorkspaceChannelKeys(msg *core.Message) {
 	msg.ChannelKey = rctx.chatID + ":topic:" + rootID
 	msg.LegacyChannelKey = rctx.chatID
 }
+
 // bufferImage adds a freshly-downloaded image to the per-session batch buffer.
 // Consecutive image-only messages from the same session (same chatID + userID
 // + parentID) coalesce into a single multi-image dispatch after imageBatchWindow
@@ -1606,8 +1702,9 @@ func (p *Platform) onMessage(ctx context.Context, event *larkim.P2MessageReceive
 				slog.Debug(p.tag()+": passing attachment through active thread without mention",
 					"chat_id", chatID, "session_key", sessionKey, "msg_type", msgType, "message_id", messageID)
 			// Allow interactive (card) messages through without @bot mention
-			// Card messages are typically alerts/notifications that should be processed
-			case msgType == "interactive":
+			// Card messages are typically alerts/notifications that should be processed.
+			// Set card_requires_mention=true to also require an @mention for cards.
+			case msgType == "interactive" && !p.cardRequiresMention:
 				slog.Debug(p.tag()+": passing interactive card message without mention",
 					"chat_id", chatID, "msg_type", msgType, "message_id", messageID)
 			default:
@@ -2327,7 +2424,7 @@ func (p *Platform) fetchSingleMessage(ctx context.Context, messageID string) *qu
 					Content string `json:"content"`
 				} `json:"body"`
 				Mentions []*larkim.Mention `json:"mentions"`
-				ParentID string             `json:"parent_id"`
+				ParentID string            `json:"parent_id"`
 			} `json:"items"`
 		} `json:"data"`
 	}
@@ -2640,9 +2737,15 @@ func extractInteractiveCardText(content string) string {
 
 // walkCardValue recursively walks any JSON value and collects
 // string values from content/text/title/plain_text keys.
+// It also resolves hyperlinks stored in separate fields (href map,
+// url, multi_url) and appends them to the corresponding text as
+// Markdown links [text](url). This handles Feishu card v2 raw_card_content
+// format where links are not inlined in the markdown content string but
+// stored in dedicated fields.
 func walkCardValue(v any, parts *[]string) {
 	switch x := v.(type) {
 	case map[string]any:
+		startIdx := len(*parts)
 		for k, val := range x {
 			lk := strings.ToLower(k)
 			switch lk {
@@ -2653,11 +2756,86 @@ func walkCardValue(v any, parts *[]string) {
 			}
 			walkCardValue(val, parts)
 		}
+		endIdx := len(*parts)
+		applyCardLinks(x, parts, startIdx, endIdx)
 	case []any:
 		for _, item := range x {
 			walkCardValue(item, parts)
 		}
 	}
+}
+
+// applyCardLinks resolves hyperlink fields on a card element and rewrites
+// the text segments produced by that element (parts[startIdx:endIdx]) to
+// include Markdown links.
+//
+// Supported link field shapes:
+//   - href: map[string]any where each key is the link text and the value
+//     is an object with a "url" field (Feishu card v2 markdown element).
+//     Every occurrence of the link text within the produced segments is
+//     replaced with [text](url).
+//   - url: string — the last produced text segment is rewritten as
+//     [text](url) (button / column / action elements).
+//   - multi_url: map[string]any with a "url" field — same as url but for
+//     multi-platform links (pc / ios / android), we take the generic url.
+func applyCardLinks(x map[string]any, parts *[]string, startIdx, endIdx int) {
+	if endIdx <= startIdx {
+		return
+	}
+
+	// 1. href map (Feishu card v2 markdown element): {"链接文字": {"url": "..."}}
+	if hrefRaw, ok := x["href"]; ok {
+		if hrefMap, ok := hrefRaw.(map[string]any); ok {
+			for linkText, linkVal := range hrefMap {
+				if linkText == "" {
+					continue
+				}
+				url := extractURLFromLinkValue(linkVal)
+				if url == "" {
+					continue
+				}
+				replacement := "[" + linkText + "](" + url + ")"
+				for i := startIdx; i < endIdx; i++ {
+					(*parts)[i] = strings.ReplaceAll((*parts)[i], linkText, replacement)
+				}
+			}
+		}
+	}
+
+	// 2. url / multi_url (button, column, action elements): attach to last text
+	elemURL := ""
+	if u, ok := x["url"]; ok {
+		elemURL = extractURLFromLinkValue(u)
+	} else if mu, ok := x["multi_url"]; ok {
+		elemURL = extractURLFromLinkValue(mu)
+	}
+	if elemURL != "" {
+		lastIdx := endIdx - 1
+		lastText := (*parts)[lastIdx]
+		// Avoid double-wrapping if the text already looks like a markdown link
+		if !strings.HasPrefix(lastText, "[") || !strings.Contains(lastText, "](") {
+			(*parts)[lastIdx] = "[" + lastText + "](" + elemURL + ")"
+		}
+	}
+}
+
+// extractURLFromLinkValue extracts a URL string from a Feishu link value
+// which may be either a plain string or an object with "url" / "pc_url"
+// / "ios_url" / "android_url" fields (multi_url shape).
+func extractURLFromLinkValue(v any) string {
+	switch val := v.(type) {
+	case string:
+		return val
+	case map[string]any:
+		// Prefer generic "url", fall back to pc_url
+		if u, ok := val["url"].(string); ok && u != "" {
+			return u
+		}
+		if u, ok := val["pc_url"].(string); ok && u != "" {
+			return u
+		}
+	}
+	return ""
 }
 
 // dedupeStrings removes adjacent duplicates from a string slice.

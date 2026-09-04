@@ -179,6 +179,34 @@ func TestMapSessionUpdate_reasoningChunk(t *testing.T) {
 	}
 }
 
+// TestMapSessionUpdate_agentThoughtChunk is a regression test for Hermes, which
+// emits reasoning as "agent_thought_chunk" (thought, not the "agent_thinking_chunk"
+// spelling the fallback originally listed). It MUST map to EventThinking so the
+// display.thinking_messages=false switch can suppress it; before the fix it fell
+// through to the generic-text branch and leaked into IM as a normal answer.
+func TestMapSessionUpdate_agentThoughtChunk(t *testing.T) {
+	cases := []string{"agent_thought_chunk", "thought_chunk", "thought"}
+	for _, kind := range cases {
+		params := json.RawMessage(`{
+			"sessionId": "s1",
+			"update": {
+				"sessionUpdate": "` + kind + `",
+				"content": {"type": "text", "text": "internal reasoning"}
+			}
+		}`)
+		evs := mapSessionUpdate("", params)
+		if len(evs) != 1 {
+			t.Fatalf("%s: expected 1 event, got %+v", kind, evs)
+		}
+		if evs[0].Type != core.EventThinking {
+			t.Fatalf("%s: expected EventThinking, got %v (content would leak to IM)", kind, evs[0].Type)
+		}
+		if evs[0].Content != "internal reasoning" {
+			t.Fatalf("%s: unexpected content %q", kind, evs[0].Content)
+		}
+	}
+}
+
 func TestMapSessionUpdate_toolCall(t *testing.T) {
 	params := json.RawMessage(`{
 		"sessionId": "s1",
