@@ -144,7 +144,8 @@ type Platform struct {
 	// echoQuotedInThread: when true, a freshly created thread echoes the quoted
 	// parent content once, so the topic is self-contained and the human reader
 	// does not have to jump out to the original (often off-topic) message.
-	echoQuotedInThread bool
+	echoQuotedInThread    bool
+	groupChatHistoryShare bool
 	// noReplyToTrigger: when true, send via Create instead of Im.Message.Reply (no quote to the user's message).
 	noReplyToTrigger bool
 	resolveMentions  bool
@@ -199,6 +200,13 @@ type Platform struct {
 	// Session key strategy: empty uses legacy thread_isolation/share_session_in_channel behavior.
 	// Explicit values: "hybrid" (group thread, p2p user), "user", "thread", or "chat".
 	sessionKeyStrategy string
+	// pendingGroupHistory keeps text/post messages that were observed in an
+	// allowed group chat without an explicit bot trigger. It is deliberately
+	// platform-local and in-memory: the next accepted agent turn consumes the
+	// snapshot, while slash commands that are handled by core leave it intact.
+	groupHistoryMu      sync.Mutex
+	pendingGroupHistory map[string][]groupHistoryEntry
+	nextGroupHistoryID  uint64
 
 	richCardImageMu         sync.Mutex
 	richCardImageResolved   map[string]string
@@ -222,6 +230,29 @@ type Platform struct {
 	imageBatchMu     sync.Mutex
 	imageBatch       map[string]*imageBatchEntry
 	imageBatchWindow time.Duration // quiet period before flushing a batch; 0 means use defaultImageBatchWindow
+
+	// resourceDownloadHTTP is the bare HTTP client used to download message
+	// resources directly from Feishu with HTTP Range requests. The larkim SDK's
+	// GetMessageResource does not expose a Range header (#1741), so for files
+	// larger than ~2MB the SDK issues a plain GET and Feishu rejects the
+	// response with code=234037. Bypassing the SDK with our own client and
+	// Range header is the supported workaround.
+	resourceDownloadHTTP *http.Client
+	// resourceChunkSize is the byte size of each Range request issued during
+	// chunked downloads. 8 MiB matches Feishu's documented guidance and keeps
+	// memory bounded. Operators can override via resource_chunk_size_bytes in
+	// config; values are clamped to [1 MiB, 64 MiB].
+	resourceChunkSize int64
+	// resourceMaxBytes caps the total bytes a single resource download may
+	// consume, guarding against adversarial servers that report an
+	// unboundedly large Content-Length. 512 MiB matches cc-connect's own
+	// inbound attachment cap and is large enough for any plausible bot user
+	// attachment on Feishu/Lark today.
+	resourceMaxBytes int64
+	// fetchResourceToken returns the bearer token used for resource downloads.
+	// When nil, defaults to fetchFreshTenantAccessToken. Indirected so unit
+	// tests can inject a stub without spinning up the full lark SDK.
+	fetchResourceToken func(ctx context.Context) (string, error)
 }
 
 // defaultImageBatchWindow is the quiet period after the last image in a
@@ -232,6 +263,17 @@ type Platform struct {
 // image sends. Operators that need a longer or shorter window can override
 // it via the platform option `image_batch_window_ms`.
 const defaultImageBatchWindow = 500 * time.Millisecond
+
+// defaultResourceMaxBytes caps the total bytes a single Feishu resource
+// download may consume. Feishu's message-resource endpoint does not validate
+// caller-side size limits beyond the per-app upload cap (typically 1 GiB for
+// files; 60 MiB for images), and a misconfigured server can advertise a
+// Content-Length orders of magnitude larger than the actual resource. 512 MiB
+// matches the inbound attachment cap cc-connect applies everywhere else and is
+// large enough to cover any realistic bot user attachment on Feishu/Lark.
+// Operators that need to download larger files can raise this via
+// resource_max_bytes; the value is clamped to a sane minimum of 1 MiB.
+const defaultResourceMaxBytes int64 = 512 * 1024 * 1024
 
 // batchWindow returns the effective image-batch coalesce window for this
 // Platform. Tests and zero-initialised Platforms fall back to the default so
@@ -281,6 +323,7 @@ type imageBatchEntry struct {
 	chatName     string
 	rctx         replyContext
 	quoted       quotedMessage
+	onAccepted   func()
 	images       []core.ImageAttachment
 	messageIDs   []string
 	createTimeMs int64
@@ -351,6 +394,7 @@ func newPlatform(name, domain string, opts map[string]any) (core.Platform, error
 	threadIsolation, _ := opts["thread_isolation"].(bool)
 	cardRequiresMention, _ := opts["card_requires_mention"].(bool)
 	echoQuotedInThread, _ := opts["echo_quoted_in_thread"].(bool)
+	groupChatHistoryShare, _ := opts["group_chat_history_share"].(bool)
 	resolveMentionsOpt, _ := opts["resolve_mentions"].(bool)
 	noReplyToTrigger := false
 	if v, ok := opts["reply_to_trigger"].(bool); ok && !v {
@@ -423,6 +467,27 @@ func newPlatform(name, domain string, opts map[string]any) (core.Platform, error
 		imageBatchWindow = time.Duration(ms) * time.Millisecond
 	}
 
+	// resource_chunk_size_bytes: byte size for each Range request when chunked-
+	// downloading Feishu message resources (issue #1741). The larkim SDK does
+	// not expose Range headers, so for resources above ~2 MiB a plain GET
+	// returns code=234037. Default 8 MiB; clamped to [1 MiB, 64 MiB].
+	resourceChunkSize := int64(8 * 1024 * 1024)
+	if raw, ok := opts["resource_chunk_size_bytes"]; ok {
+		n, err := coerceMilliseconds(raw)
+		if err != nil {
+			return nil, fmt.Errorf("%s: invalid resource_chunk_size_bytes %v: %w", name, raw, err)
+		}
+		if n > 0 {
+			resourceChunkSize = n
+		}
+	}
+	if resourceChunkSize < 1*1024*1024 {
+		resourceChunkSize = 1 * 1024 * 1024
+	}
+	if resourceChunkSize > 64*1024*1024 {
+		resourceChunkSize = 64 * 1024 * 1024
+	}
+
 	// Webhook mode configuration (for Lark international version)
 	port, _ := opts["port"].(string)
 	if port == "" {
@@ -458,6 +523,7 @@ func newPlatform(name, domain string, opts map[string]any) (core.Platform, error
 		threadIsolation:            threadIsolation,
 		cardRequiresMention:        cardRequiresMention,
 		echoQuotedInThread:         echoQuotedInThread,
+		groupChatHistoryShare:      groupChatHistoryShare,
 		resolveMentions:            resolveMentionsOpt,
 		noReplyToTrigger:           noReplyToTrigger,
 		sessionKeyStrategy:         sessionKeyStrategy,
@@ -471,6 +537,9 @@ func newPlatform(name, domain string, opts map[string]any) (core.Platform, error
 		mentionMap:                 mentionMap,
 		imageBatch:                 make(map[string]*imageBatchEntry),
 		imageBatchWindow:           imageBatchWindow,
+		resourceDownloadHTTP:       &http.Client{Timeout: 60 * time.Second},
+		resourceChunkSize:          resourceChunkSize,
+		resourceMaxBytes:           defaultResourceMaxBytes,
 	}
 	if !useInteractiveCard {
 		base.self = base
@@ -1254,6 +1323,12 @@ func (p *Platform) shouldSendAck(msg *core.Message) bool {
 
 // sendAckMessage sends the ack message and records throttle timestamp
 func (p *Platform) sendAckMessage(msg *core.Message) {
+	// Lightweight in-memory test platforms build a Platform without a real lark
+	// client; there is nothing to send an ack through, so skip instead of
+	// dereferencing a nil client inside the reply call chain.
+	if p.client == nil {
+		return
+	}
 	ackText := p.buildAckText(msg.Content)
 	ackTextWithKey := fmt.Sprintf("%s\n[session: %s]", ackText, msg.SessionKey)
 	if err := p.Send(context.Background(), msg.ReplyCtx, ackTextWithKey); err != nil {
@@ -1557,6 +1632,7 @@ func (p *Platform) dispatchImageBatchEntry(entry *imageBatchEntry) {
 		UserID:    entry.userID, UserName: entry.userName, ChatName: entry.chatName,
 		Content:           "",
 		ExtraContent:      entry.quoted.text,
+		OnAccepted:        entry.onAccepted,
 		Images:            append(entry.quoted.images, entry.images...),
 		ReplyCtx:          entry.rctx,
 		UserMessageTimeMs: entry.createTimeMs,
@@ -1580,6 +1656,7 @@ func (p *Platform) onMessageRecalled(_ context.Context, event *larkim.P2MessageR
 	}
 
 	p.markMessageRecalled(messageID)
+	p.removeGroupHistory(messageID)
 	slog.Info(p.tag()+": message recalled",
 		"message_id", messageID,
 		"chat_id", chatID,
@@ -1597,6 +1674,213 @@ func (p *Platform) onMessageRecalled(_ context.Context, event *larkim.P2MessageR
 		ReplyCtx:  replyContext{messageID: messageID, chatID: chatID},
 	})
 	return nil
+}
+
+func isGroupHistoryMessageType(msgType string) bool {
+	return msgType == "text" || msgType == "post"
+}
+
+// groupHistoryScope deliberately differs from makeSessionKey. With
+// thread_isolation enabled, a main-channel mention creates a root-scoped
+// agent session, but later main-channel messages must remain in the chat-level
+// history rather than being attached to that forked session.
+func (p *Platform) groupHistoryScope(msg *larkim.EventMessage, chatID string) string {
+	if chatID == "" {
+		return ""
+	}
+	if p.threadIsolation && msg != nil && stringValue(msg.ChatType) == "group" {
+		if rootID := stringValue(msg.RootId); rootID != "" {
+			return "thread:" + chatID + ":" + rootID
+		}
+	}
+	return "chat:" + chatID
+}
+
+func (p *Platform) historyText(msgType, content string, mentions []*larkim.MentionEvent) string {
+	if content == "" {
+		return ""
+	}
+	switch msgType {
+	case "text":
+		var textBody struct {
+			Text string `json:"text"`
+		}
+		if err := json.Unmarshal([]byte(content), &textBody); err != nil {
+			return ""
+		}
+		return stripMentions(textBody.Text, mentions, p.getBotOpenID())
+	case "post":
+		return strings.TrimSpace(extractPostPlainText(content))
+	default:
+		return ""
+	}
+}
+
+func (p *Platform) rememberGroupHistory(scope, messageID, msgType, content string, mentions []*larkim.MentionEvent, senderID, senderType string) {
+	if !p.groupChatHistoryShare || scope == "" || !isGroupHistoryMessageType(msgType) {
+		return
+	}
+	text := p.historyText(msgType, content, mentions)
+	if text == "" {
+		return
+	}
+
+	p.groupHistoryMu.Lock()
+	defer p.groupHistoryMu.Unlock()
+	p.nextGroupHistoryID++
+	entry := groupHistoryEntry{
+		id:         p.nextGroupHistoryID,
+		messageID:  messageID,
+		senderID:   senderID,
+		senderType: senderType,
+		text:       text,
+	}
+	history := append(p.pendingGroupHistory[scope], entry)
+	if len(history) > maxPendingGroupHistoryEntries {
+		history = history[len(history)-maxPendingGroupHistoryEntries:]
+	}
+	if p.pendingGroupHistory == nil {
+		p.pendingGroupHistory = make(map[string][]groupHistoryEntry)
+	}
+	p.pendingGroupHistory[scope] = history
+}
+
+func (p *Platform) removeGroupHistory(messageID string) {
+	if messageID == "" {
+		return
+	}
+	p.groupHistoryMu.Lock()
+	defer p.groupHistoryMu.Unlock()
+	for scope, history := range p.pendingGroupHistory {
+		kept := history[:0]
+		for _, entry := range history {
+			if entry.messageID != messageID {
+				kept = append(kept, entry)
+			}
+		}
+		if len(kept) == 0 {
+			delete(p.pendingGroupHistory, scope)
+		} else {
+			p.pendingGroupHistory[scope] = kept
+		}
+	}
+}
+
+func (p *Platform) snapshotGroupHistory(scope string) groupHistoryContext {
+	if !p.groupChatHistoryShare || scope == "" {
+		return groupHistoryContext{}
+	}
+
+	p.groupHistoryMu.Lock()
+	history := append([]groupHistoryEntry(nil), p.pendingGroupHistory[scope]...)
+	p.groupHistoryMu.Unlock()
+	if len(history) == 0 {
+		return groupHistoryContext{}
+	}
+
+	maxID := history[len(history)-1].id
+	var once sync.Once
+	return groupHistoryContext{
+		entries: history,
+		onAccepted: func() {
+			once.Do(func() { p.consumeGroupHistory(scope, maxID) })
+		},
+	}
+}
+
+func (p *Platform) consumeGroupHistory(scope string, maxID uint64) {
+	p.groupHistoryMu.Lock()
+	defer p.groupHistoryMu.Unlock()
+	history := p.pendingGroupHistory[scope]
+	kept := history[:0]
+	for _, entry := range history {
+		if entry.id > maxID {
+			kept = append(kept, entry)
+		}
+	}
+	if len(kept) == 0 {
+		delete(p.pendingGroupHistory, scope)
+		return
+	}
+	p.pendingGroupHistory[scope] = kept
+}
+
+func (p *Platform) resetGroupHistory(scope string) {
+	if scope == "" {
+		return
+	}
+	p.groupHistoryMu.Lock()
+	delete(p.pendingGroupHistory, scope)
+	p.groupHistoryMu.Unlock()
+}
+
+func (p *Platform) historySenderName(entry groupHistoryEntry) string {
+	if strings.EqualFold(entry.senderType, "app") {
+		return p.resolveBotSenderName(entry.senderID)
+	}
+	if entry.senderID == "" {
+		return "User"
+	}
+	if cached, ok := p.userNameCache.Load(entry.senderID); ok {
+		if name, ok := cached.(string); ok && name != "" {
+			return name
+		}
+	}
+	if p.client != nil {
+		if name := p.resolveUserName(entry.senderID); name != "" && name != entry.senderID {
+			return name
+		}
+	}
+	return entry.senderID
+}
+
+func (p *Platform) formatGroupHistory(ctx groupHistoryContext) string {
+	if len(ctx.entries) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	formatted := 0
+	for _, entry := range ctx.entries {
+		if entry.messageID != "" && p.isMessageRecalled(entry.messageID) {
+			continue
+		}
+		if formatted == 0 {
+			b.WriteString("--- Recent Feishu group messages (context only) ---\n")
+		}
+		name := strings.NewReplacer("\n", " ", "\r", "").Replace(p.historySenderName(entry))
+		fmt.Fprintf(&b, "%s:\n%s\n\n", name, entry.text)
+		formatted++
+	}
+	if formatted == 0 {
+		return ""
+	}
+	b.WriteString("---\n\n")
+	return b.String()
+}
+
+func joinFeishuExtraContent(parts ...string) string {
+	var nonEmpty []string
+	for _, part := range parts {
+		if strings.TrimSpace(part) != "" {
+			nonEmpty = append(nonEmpty, strings.TrimSpace(part))
+		}
+	}
+	return strings.Join(nonEmpty, "\n\n")
+}
+
+func (p *Platform) isGroupHistoryNewCommand(msgType, content string, mentions []*larkim.MentionEvent) bool {
+	if msgType != "text" {
+		return false
+	}
+	var textBody struct {
+		Text string `json:"text"`
+	}
+	if json.Unmarshal([]byte(content), &textBody) != nil {
+		return false
+	}
+	text := strings.TrimSpace(stripMentions(textBody.Text, mentions, p.getBotOpenID()))
+	fields := strings.Fields(text)
+	return len(fields) > 0 && strings.EqualFold(fields[0], "/new")
 }
 
 func (p *Platform) onMessage(ctx context.Context, event *larkim.P2MessageReceiveV1) error {
@@ -1624,6 +1908,10 @@ func (p *Platform) onMessage(ctx context.Context, event *larkim.P2MessageReceive
 		chatID = *msg.ChatId
 	}
 	userID := userIDFromEvent(sender.SenderId)
+	senderType := ""
+	if sender.SenderType != nil {
+		senderType = *sender.SenderType
+	}
 	// userName and chatName are resolved in dispatchMessage to avoid blocking
 	// the SDK dispatcher goroutine with synchronous HTTP calls.
 	if botOpenID := p.getBotOpenID(); botOpenID != "" && userID == botOpenID {
@@ -1678,6 +1966,28 @@ func (p *Platform) onMessage(ctx context.Context, event *larkim.P2MessageReceive
 	// Pre-compute sessionKey so the @bot filter below can consult the active
 	// thread set; sessionKey is also used downstream for dispatch.
 	sessionKey := p.makeSessionKey(msg, chatID, userID)
+	botOpenID := p.getBotOpenID()
+	filterActive := botOpenID != "" || p.IsGroupFilterDegraded()
+	botMentioned := botOpenID != "" && isBotMentioned(msg.Mentions, botOpenID)
+	atEveryone := p.respondToAtEveryoneAndHere && msg.Content != nil && strings.Contains(*msg.Content, "@_all")
+
+	// With history sharing enabled, observe ordinary text/post messages only
+	// after the chat-level allow list has admitted the chat. Do this before the
+	// existing mention filter and before allow_from: the chat controls whether
+	// cc-connect may observe the conversation, while allow_from controls who may
+	// trigger an agent turn.
+	if p.groupChatHistoryShare && chatType == "group" && !p.groupReplyAll && botOpenID != "" &&
+		!botMentioned && !atEveryone && isGroupHistoryMessageType(msgType) {
+		if !core.AllowList(p.allowChat, chatID) {
+			slog.Debug(p.tag()+": group history ignored for unauthorized chat", "chat_id", chatID)
+			return nil
+		}
+		p.rememberGroupHistory(
+			p.groupHistoryScope(msg, chatID), messageID, msgType, stringValue(msg.Content), msg.Mentions,
+			userID, senderType,
+		)
+		return nil
+	}
 
 	// Issue #1618: the mention filter used to gate on `botOpenID != ""`,
 	// which silently *disabled* filtering when bot discovery had failed
@@ -1685,13 +1995,11 @@ func (p *Platform) onMessage(ctx context.Context, event *larkim.P2MessageReceive
 	// rest of the process lifetime. We now consult both flags: when
 	// the filter is degraded we fail closed (drop the message) and
 	// emit a periodic warning, instead of failing open.
-	botOpenID := p.getBotOpenID()
-	filterActive := botOpenID != "" || p.IsGroupFilterDegraded()
 	if chatType == "group" && !p.groupReplyAll && filterActive {
-		if !isBotMentioned(msg.Mentions, botOpenID) {
+		if !botMentioned {
 			switch {
 			// Feishu @all sends {"text":"@_all"} with 0 mentions.
-			case p.respondToAtEveryoneAndHere && msg.Content != nil && strings.Contains(*msg.Content, "@_all"):
+			case atEveryone:
 				slog.Debug(p.tag()+": responding to @all message", "chat_id", chatID)
 			// Once a thread has been engaged via @bot, allow follow-up
 			// attachment-only messages (image/file/audio) in the same thread
@@ -1754,6 +2062,15 @@ func (p *Platform) onMessage(ctx context.Context, event *larkim.P2MessageReceive
 	parentID := stringValue(msg.ParentId)
 
 	rctx := p.makeReplyContext(msg, messageID, chatID, sessionKey)
+	var groupHistoryCtx groupHistoryContext
+	if p.groupChatHistoryShare && chatType == "group" && !p.groupReplyAll && botOpenID != "" && (botMentioned || atEveryone) {
+		scope := p.groupHistoryScope(msg, chatID)
+		if p.isGroupHistoryNewCommand(msgType, content, mentions) {
+			p.resetGroupHistory(scope)
+		} else {
+			groupHistoryCtx = p.snapshotGroupHistory(scope)
+		}
+	}
 	slog.Debug(p.tag()+": routed inbound message",
 		"message_id", messageID,
 		"session_key", sessionKey,
@@ -1773,7 +2090,7 @@ func (p *Platform) onMessage(ctx context.Context, event *larkim.P2MessageReceive
 	// blocked by IO-heavy operations (image/audio download, handler HTTP calls).
 	// The dedup and old-message checks above remain synchronous to guarantee
 	// correctness before spawning the goroutine.
-	go p.dispatchMessage(ctx, msgType, content, mentions, messageID, sessionKey, userID, chatID, rctx, parentID, stringValue(msg.ThreadId), createTimeMs)
+	go p.dispatchMessageWithHistory(ctx, msgType, content, mentions, messageID, sessionKey, userID, chatID, rctx, parentID, createTimeMs, groupHistoryCtx)
 
 	return nil
 }
@@ -1790,7 +2107,11 @@ func (p *Platform) replyUnauthorizedAccess(ctx context.Context, rctx replyContex
 // dispatchMessage handles the message content parsing, media download, and
 // handler invocation. It runs in its own goroutine so that onMessage returns
 // quickly and does not block the SDK event loop.
-func (p *Platform) dispatchMessage(ctx context.Context, msgType, content string, mentions []*larkim.MentionEvent, messageID, sessionKey, userID, chatID string, rctx replyContext, parentID, threadID string, createTimeMs int64) {
+func (p *Platform) dispatchMessage(ctx context.Context, msgType, content string, mentions []*larkim.MentionEvent, messageID, sessionKey, userID, chatID string, rctx replyContext, parentID string, createTimeMs int64) {
+	p.dispatchMessageWithHistory(ctx, msgType, content, mentions, messageID, sessionKey, userID, chatID, rctx, parentID, createTimeMs, groupHistoryContext{})
+}
+
+func (p *Platform) dispatchMessageWithHistory(ctx context.Context, msgType, content string, mentions []*larkim.MentionEvent, messageID, sessionKey, userID, chatID string, rctx replyContext, parentID string, createTimeMs int64, groupHistoryCtx groupHistoryContext) {
 	if p.isMessageRecalled(messageID) {
 		slog.Debug(p.tag()+": recalled message ignored in async dispatch", "message_id", messageID)
 		return
@@ -1815,6 +2136,14 @@ func (p *Platform) dispatchMessage(ctx context.Context, msgType, content string,
 	if parentID != "" && (!p.threadIsolation || !isThreadSessionKey(sessionKey) || rctx.bootstrapThread) {
 		quoted = p.fetchQuotedMessage(ctx, parentID)
 	}
+	historyText := p.formatGroupHistory(groupHistoryCtx)
+	dispatchCore := func(msg *core.Message) {
+		if historyText != "" {
+			msg.ExtraContent = joinFeishuExtraContent(historyText, msg.ExtraContent)
+			msg.OnAccepted = groupHistoryCtx.onAccepted
+		}
+		p.dispatchCoreMessage(msg)
+	}
 
 	switch msgType {
 	case "text":
@@ -1834,7 +2163,7 @@ func (p *Platform) dispatchMessage(ctx context.Context, msgType, content string,
 		// zero file-resource API calls.
 		approvedFileMetas := p.filterQuotedFilesForUser(quoted.files, mentions, userID)
 		quotedFiles := p.downloadQuotedFiles(ctx, approvedFileMetas)
-		if text == "" && quoted.text == "" && len(quoted.images) == 0 && len(quotedFiles) == 0 {
+		if text == "" && historyText == "" && quoted.text == "" && len(quoted.images) == 0 && len(quotedFiles) == 0 {
 			slog.Debug(p.tag()+": dropping empty text after mention stripping",
 				"message_id", messageID,
 				"raw_text_len", len(textBody.Text),
@@ -1846,7 +2175,7 @@ func (p *Platform) dispatchMessage(ctx context.Context, msgType, content string,
 		// reaches the engine before the text message advances the user-message
 		// watermark (#1686 P1-B, related #1395).
 		p.flushImageBatchForSession(sessionKey)
-		p.dispatchCoreMessage(&core.Message{
+		dispatchCore(&core.Message{
 			SessionKey: sessionKey, Platform: p.platformName,
 			MessageID: messageID,
 			UserID:    userID, UserName: userName, ChatName: chatName,
@@ -1884,6 +2213,8 @@ func (p *Platform) dispatchMessage(ctx context.Context, msgType, content string,
 				userName:     userName,
 				chatName:     chatName,
 				rctx:         rctx,
+				quoted:       quotedMessage{text: historyText, images: quoted.images},
+				onAccepted:   groupHistoryCtx.onAccepted,
 				images:       []core.ImageAttachment{{MimeType: mimeType, Data: imgData}},
 				messageIDs:   []string{messageID},
 				createTimeMs: createTimeMs,
@@ -1891,7 +2222,7 @@ func (p *Platform) dispatchMessage(ctx context.Context, msgType, content string,
 			})
 			return
 		}
-		p.dispatchCoreMessage(&core.Message{
+		dispatchCore(&core.Message{
 			SessionKey: sessionKey, Platform: p.platformName,
 			MessageID: messageID,
 			UserID:    userID, UserName: userName, ChatName: chatName,
@@ -1924,7 +2255,7 @@ func (p *Platform) dispatchMessage(ctx context.Context, msgType, content string,
 		// reaches the engine before this audio message advances the user-message
 		// watermark (#1686 P1-B).
 		p.flushImageBatchForSession(sessionKey)
-		p.dispatchCoreMessage(&core.Message{
+		dispatchCore(&core.Message{
 			SessionKey: sessionKey, Platform: p.platformName,
 			MessageID: messageID,
 			UserID:    userID, UserName: userName, ChatName: chatName,
@@ -1941,12 +2272,12 @@ func (p *Platform) dispatchMessage(ctx context.Context, msgType, content string,
 	case "post":
 		textParts, images := p.parsePostContent(messageID, content)
 		text := stripMentions(strings.Join(textParts, "\n"), mentions, p.getBotOpenID())
-		if text == "" && len(images) == 0 && quoted.text == "" && len(quoted.images) == 0 {
+		if text == "" && historyText == "" && len(images) == 0 && quoted.text == "" && len(quoted.images) == 0 {
 			return
 		}
 		// Flush any image batch buffered earlier in this session (#1686 P1-B).
 		p.flushImageBatchForSession(sessionKey)
-		p.dispatchCoreMessage(&core.Message{
+		dispatchCore(&core.Message{
 			SessionKey: sessionKey, Platform: p.platformName,
 			MessageID: messageID,
 			UserID:    userID, UserName: userName, ChatName: chatName,
@@ -1977,7 +2308,7 @@ func (p *Platform) dispatchMessage(ctx context.Context, msgType, content string,
 		mimeType := detectMimeType(fileData)
 		// Flush any image batch buffered earlier in this session (#1686 P1-B).
 		p.flushImageBatchForSession(sessionKey)
-		p.dispatchCoreMessage(&core.Message{
+		dispatchCore(&core.Message{
 			SessionKey: sessionKey, Platform: p.platformName,
 			MessageID: messageID,
 			UserID:    userID, UserName: userName, ChatName: chatName,
@@ -2008,7 +2339,7 @@ func (p *Platform) dispatchMessage(ctx context.Context, msgType, content string,
 			ReplyCtx:          rctx,
 			UserMessageTimeMs: createTimeMs,
 		}
-		p.dispatchCoreMessage(coreMsg)
+		dispatchCore(coreMsg)
 
 	case "sticker":
 		var stickerBody struct {
@@ -2024,7 +2355,7 @@ func (p *Platform) dispatchMessage(ctx context.Context, msgType, content string,
 			slog.Warn(p.tag()+": download sticker failed, falling back to placeholder", "error", err)
 			// Flush any image batch buffered earlier in this session (#1686 P1-B).
 			p.flushImageBatchForSession(sessionKey)
-			p.dispatchCoreMessage(&core.Message{
+			dispatchCore(&core.Message{
 				SessionKey: sessionKey, Platform: p.platformName,
 				MessageID: messageID,
 				UserID:    userID, UserName: userName, ChatName: chatName,
@@ -2035,7 +2366,7 @@ func (p *Platform) dispatchMessage(ctx context.Context, msgType, content string,
 		}
 		// Flush any image batch buffered earlier in this session (#1686 P1-B).
 		p.flushImageBatchForSession(sessionKey)
-		p.dispatchCoreMessage(&core.Message{
+		dispatchCore(&core.Message{
 			SessionKey: sessionKey, Platform: p.platformName,
 			MessageID: messageID,
 			UserID:    userID, UserName: userName, ChatName: chatName,
@@ -2074,7 +2405,7 @@ func (p *Platform) dispatchMessage(ctx context.Context, msgType, content string,
 		}
 		// Flush any image batch buffered earlier in this session (#1686 P1-B).
 		p.flushImageBatchForSession(sessionKey)
-		p.dispatchCoreMessage(&core.Message{
+		dispatchCore(&core.Message{
 			SessionKey: sessionKey, Platform: p.platformName,
 			MessageID: messageID,
 			UserID:    userID, UserName: userName, ChatName: chatName,
@@ -2360,12 +2691,36 @@ type quotedMessage struct {
 	files  []quotedFileMeta
 }
 
-// chainMessage is an alias used by the reply-chain traversal helpers.
+// chainMessage is an alias used by the reply-chain traversal helpers. The
+// underlying quotedParent struct already carries the same fields upstream's
+// chainMessage uses, so the alias keeps both naming styles compiling.
 type chainMessage = quotedParent
 
-// maxReplyChainDepth limits how many parent links we follow when building
-// a multi-level reply chain for quote injection.
-const maxReplyChainDepth = 10
+// maxPendingGroupHistoryEntries bounds the per-scope in-memory buffer. The
+// feature is intentionally a small recent-context window rather than a chat
+// history store.
+const maxPendingGroupHistoryEntries = 50
+
+type groupHistoryEntry struct {
+	id         uint64
+	messageID  string
+	senderID   string
+	senderType string
+	text       string
+}
+
+// groupHistoryContext is captured synchronously when a triggering event is
+// received, before its asynchronous dispatch can race with later events.
+// onAccepted consumes only that captured prefix once the core accepts a real
+// agent turn. Recognized slash commands return before OnAccepted is called.
+type groupHistoryContext struct {
+	entries    []groupHistoryEntry
+	onAccepted func()
+}
+
+// maxReplyChainDepth is the maximum number of parent messages to traverse
+// when building a reply chain. This limits API calls per inbound reply.
+const maxReplyChainDepth = 5
 
 // fetchQuotedMessage retrieves the content of a parent message that the user
 // is replying to, and returns formatted context plus downloaded attachments.
@@ -3307,24 +3662,14 @@ func buildFeishuFileMessageContent(msgType, fileKey string) (string, error) {
 }
 
 func (p *Platform) downloadImage(messageID, imageKey string) ([]byte, string, error) {
-	resp, err := p.client.Im.MessageResource.Get(context.Background(),
-		larkim.NewGetMessageResourceReqBuilder().
-			MessageId(messageID).
-			FileKey(imageKey).
-			Type("image").
-			Build())
+	// Issue #1741: large image bodies suffer the same code=234037 truncation
+	// as files when fetched through the larkim SDK (which cannot set Range
+	// headers). Route image downloads through the same chunked helper used
+	// for files so a 20-MiB screenshot lands whole instead of being capped
+	// at the SDK's ~2 MiB streaming ceiling.
+	data, err := p.downloadResourceChunked(context.Background(), messageID, imageKey, "image")
 	if err != nil {
-		return nil, "", fmt.Errorf("%s: image API: %w", p.tag(), err)
-	}
-	if !resp.Success() {
-		return nil, "", fmt.Errorf("%s: image API code=%d msg=%s", p.tag(), resp.Code, resp.Msg)
-	}
-	if resp.File == nil {
-		return nil, "", fmt.Errorf("%s: image API returned nil file body", p.tag())
-	}
-	data, err := io.ReadAll(resp.File)
-	if err != nil {
-		return nil, "", fmt.Errorf("%s: read image: %w", p.tag(), err)
+		return nil, "", fmt.Errorf("%s: image download: %w", p.tag(), err)
 	}
 
 	mimeType := detectMimeType(data)
@@ -3333,24 +3678,14 @@ func (p *Platform) downloadImage(messageID, imageKey string) ([]byte, string, er
 }
 
 func (p *Platform) downloadResource(messageID, fileKey, resType string) ([]byte, error) {
-	resp, err := p.client.Im.MessageResource.Get(context.Background(),
-		larkim.NewGetMessageResourceReqBuilder().
-			MessageId(messageID).
-			FileKey(fileKey).
-			Type(resType).
-			Build())
+	// Issue #1741: the larkim SDK issues a plain GET that Feishu truncates
+	// with code=234037 for resources above ~2 MiB. downloadResourceChunked
+	// bypasses the SDK, sends Range headers, and reassembles the bytes
+	// client-side. All four existing call sites (audio body, file body,
+	// merge_forward file, #1588 quoted file) flow through here unchanged.
+	data, err := p.downloadResourceChunked(context.Background(), messageID, fileKey, resType)
 	if err != nil {
-		return nil, fmt.Errorf("%s: resource API: %w", p.tag(), err)
-	}
-	if !resp.Success() {
-		return nil, fmt.Errorf("%s: resource API code=%d msg=%s", p.tag(), resp.Code, resp.Msg)
-	}
-	if resp.File == nil {
-		return nil, fmt.Errorf("%s: resource API returned nil file body", p.tag())
-	}
-	data, err := io.ReadAll(resp.File)
-	if err != nil {
-		return nil, fmt.Errorf("%s: read resource: %w", p.tag(), err)
+		return nil, err
 	}
 	slog.Debug(p.tag()+": downloaded resource", "key", fileKey, "type", resType, "size", len(data))
 	return data, nil
@@ -4198,8 +4533,10 @@ func isTenantAccessTokenInvalid(err error) bool {
 	return strings.Contains(msg, "99991663") || strings.Contains(msg, "invalid access token")
 }
 
-// Transient retry constants for network-level failures.
-const (
+// Transient retry settings for network-level failures. Declared as var (not
+// const) so tests can shrink the retry window; production callers never
+// touch them after init.
+var (
 	maxTransientRetries    = 3
 	transientRetryInitial  = 500 * time.Millisecond
 	transientRetryMaxDelay = 5 * time.Second
