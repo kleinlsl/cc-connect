@@ -20,9 +20,13 @@ Beta since v1.5.0 stable — 16 merged PRs focused on Feishu/Weixin reliability,
 ## Unreleased
 
 ### Added
+- **`footer_template`**: new per-project config option for customizing the CCD-style reply footer format using Go `text/template` syntax. Available placeholders: {{.Model}}, {{.Effort}}, {{.Out}}, {{.In}}, {{.CW}}, {{.CR}}, {{.Ctx}}, {{.Elapsed}}, {{.Workdir}}. Falls back to default format on parse error.
 - **`agent_session_idle_timeout_mins`**: new per-project config option that closes an idle live agent process after a clean turn while preserving the cc-connect session and saved agent session ID. The next message starts a new agent process and resumes the same conversation. Set to `0` or leave unset to disable (#1338).
 - **Reasonix agent**: new agent adapter for Reasonix multi-model coding agent, bridging via HTTP serve API (POST /submit, SSE /events, POST /approve). Supports default/yolo/plan permission modes, SSE auto-reconnect with backoff, and thinking accumulator. (#1281)
 - **cloud_web platform**: 新增 self-hosted IM Gateway 作为 first-class platform 接入 (CWIP v1 协议,支持 websocket / long_poll / gateway 3 种 transport,完整 inbound/outbound + capability negotiation + graceful degradation)。 详见 docs/cloud-web.md + #1282。
+
+### Fixed
+- **ACP `/stop` session corruption**: `/stop` on ACP sessions now kills the process and cleans up state (matching Claude Code behavior) instead of keeping the broken process alive.
 
 ## Unreleased
 

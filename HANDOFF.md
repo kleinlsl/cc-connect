@@ -1,6 +1,6 @@
 # HANDOFF — cc-connect
 
-更新时间：2026-09-06 10:50。仓库：origin=kleinlsl/cc-connect（fork），upstream=chenhg5/cc-connect（主仓库）。
+更新时间：2026-09-06 17:15。仓库：origin=kleinlsl/cc-connect（fork），upstream=chenhg5/cc-connect（主仓库）。
 
 ## 当前目标
 1. **【已修复并上线】问题 A**：Hermes(ACP) 长任务结束后「最终回复在飞书发两遍」。三层修复 + 回归测试完成，全量测试全绿，已交叉编译部署（PID 5849，projects=4）。

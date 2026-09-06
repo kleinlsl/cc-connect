@@ -42,6 +42,8 @@
 | 11 | 模型明明 `turn complete` 了，飞书却没收到回复（本机↔飞书网络抖动几分钟） | 旧逻辑同步重试只 3 次、约 3.5 秒就放弃，最终回复被永久丢弃，**无补发** | 两层兜底：①同步重试窗口拉到约 1 分钟；②新增持久化 **outbox 发件箱**，最终回复落盘、网络恢复/重启后自动补发；并补 immediateHeld 互斥 + 飞书 uuid 幂等，长任务不再把同一条回复发两遍（见 [4.11](#411-网络抖动导致模型已生成的回复丢失outbox-补发)） |
 | 12 | 飞书对 Hermes 发 `/compact` 提示「不支持上下文压缩」；发 `/model` 提示「不支持模型切换」 | cc 的 `/compact`、`/model` 是内置命令，要求 agent 实现 `ContextCompressor` / `ModelSwitcher`，通用 ACP adapter 都没实现，命令在 core 被拦下、**到不了 Hermes**；而 Hermes 原生用的是 `/compress`、`/model`（走 session/prompt 文本通道） | ACP 新增可配置 `compress_command` / `model_command`，把 cc 的 `/compact`、`/model` **透传**成 Hermes 原生斜杠命令并把回执发回飞书；`/model <名>` 当场切当前会话、保留历史；自定义网关必须三段式 `custom:<provider>:<model>`（见 [4.12](#412-acphermes-的上下文压缩与模型切换斜杠命令透传)） |
 | 13 | Hermes(ACP) 回复底部没有 Claude 那样的 `model · out/in · ctx%` + 工作目录状态行 | 通用 ACP adapter 没实现 `GetContextUsage()`、也没消费 `usage_update`/prompt `usage`/握手 `models.currentModelId`；且 core 两行状态行原本要求必须有 Claude 的 cw/cr 信号才渲染 | ACP 上报用量与模型名，core 放宽为「有 cache 或有逐轮 in/out」即渲染，无 cw/cr 时省略该段，Claude 呈现零变化（见 [4.13](#413-hermesacp-回复底部没有状态行model--token--ctx--工作目录)） |
+| 14 | ACP `/stop` 后后续消息全部无响应（`json-rpc -32603`） | CancelTurn 保留进程+session，但 Hermes agent 被 `request_hard_interrupt` 打坏后无法自愈 | ACP `/stop` 后走 normalCleanup（杀进程+删 state），下一条消息 spawn 新进程+resume，与 Claude Code 行为一致（见 [4.14](#414-acp-stop-后-session-坏死)） |
+| 15 | 回复 footer 格式硬编码，无法自定义 | `buildClaudeStatusLineFooter` 拼接逻辑写死 | 新增 `footer_template` 配置项，支持 Go `text/template` 自定义格式（见 [6.6](#66-footer_template-自定义回复-footer-格式)） |
 
 > 经验：飞书消息问题要先区分**「飞书有没有把消息推过来」**和**「cc-connect 收到后怎么处理」**
 > 两层——前者是应用权限/事件订阅，后者才是代码与配置。很多「代码没问题但就是不触发」
@@ -687,6 +689,14 @@ line2 工作目录逻辑不变；`reply_footer` / `show_context_indicator` / `sh
 `core/claude_status_footer_test.go`（无 cache 渲染简化行、仅窗口占用回退 legacy、Claude 全字段不变）；
 端到端需在飞书给 hermes 项目发消息，看回复底部两行。
 
+
+### 4.14 ACP `/stop` 后 session 坏死
+
+**现象**：用户在飞书发 `/stop`，cc-connect 回复 "session cancelled"，但后续消息全部无响应（返回空内容 36 chars, 0 tools），session 实际已死但 cc-connect 不知道。
+
+**根因**：ACP 的 `CancelTurn()` 发送 `session/cancel` 通知给 Hermes，Hermes 调用 `request_hard_interrupt(agent)` 强制中断 LLM 流和 tool 执行。但 agent 内部状态没有被重置，后续 `session/prompt` 走通 ACP 协议但返回垃圾内容。cc-connect 认为 turn complete，继续处理下一条消息，但 agent 始终无法正常工作。
+
+**修复**：`core/engine.go` 的 `stopInteractiveSessionWithOptions`，ACP 的 CancelTurn 不再保留 session，而是 fall through 到 normalCleanup。下一条消息 spawn 新 Hermes 进程 + load session，与 Claude Code 行为一致。
 ---
 
 ## 5. 群消息响应的三档模型
@@ -772,6 +782,21 @@ max_attempts = 12    # 单条最多尝试 12 次
 
 ---
 
+
+### 6.6 `footer_template` 自定义回复 footer 格式
+
+项目级配置，支持 Go `text/template` 语法：
+
+```toml
+[[projects]]
+  name = "hermes-tujia"
+  reply_footer = true
+  show_context_indicator = true
+  footer_template = "{{.Model}} · ctx {{.Ctx}}% · {{.Elapsed}}"
+```
+
+可用模板变量：`{{.Model}}` `{{.Effort}}` `{{.Out}}` `{{.In}}` `{{.CW}}` `{{.CR}}` `{{.Ctx}}` `{{.Elapsed}}` `{{.Workdir}}`。
+不设置则使用默认格式。模板 parse 失败自动回退默认格式。
 ## 7. 排障方法论与常用命令
 
 ### 7.1 服务管理（launchd）
