@@ -7913,7 +7913,7 @@ func (e *Engine) buildClaudeStatusLineFooter(agent Agent, session AgentSession, 
 	// Elapsed duration since turn started.
 	var elapsed string
 	if !turnStart.IsZero() {
-		elapsed = time.Since(turnStart).Truncate(time.Second).String()
+		elapsed = formatElapsed(time.Since(turnStart), false, e.i18n.currentLang())
 	}
 
 	// Context-window percentage.
@@ -7928,7 +7928,7 @@ func (e *Engine) buildClaudeStatusLineFooter(agent Agent, session AgentSession, 
 	if pct > 100 {
 		pct = 100
 	}
-	ctxPct := fmt.Sprintf("%d%%", pct)
+	ctxPct := fmt.Sprintf("%d", pct)
 
 	// Token counts as formatted strings.
 	outStr := formatStatusTokenCount(usage.OutputTokens)
@@ -7984,7 +7984,7 @@ func (e *Engine) buildClaudeStatusLineFooter(agent Agent, session AgentSession, 
 			line1Parts = append(line1Parts, fmt.Sprintf("in %s", inStr))
 		}
 		if used > 0 {
-			line1Parts = append(line1Parts, fmt.Sprintf("ctx %s", ctxPct))
+			line1Parts = append(line1Parts, fmt.Sprintf("ctx %s%%", ctxPct))
 		}
 		if elapsed != "" {
 			line1Parts = append(line1Parts, elapsed)
