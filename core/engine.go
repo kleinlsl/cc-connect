@@ -22,6 +22,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"text/template"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -437,6 +438,11 @@ type Engine struct {
 	showContextIndicator bool
 	showWorkdirIndicator bool
 	replyFooterEnabled   bool
+
+	// footerTemplate is a Go text/template for the CCD-style reply footer.
+	// Empty means use the built-in default.
+	footerTemplate     string
+	footerTemplateTmpl *template.Template // parsed template (lazy)
 
 	// When true, /list etc. only show sessions tracked by cc-connect,
 	// hiding sessions created by direct CLI usage in the same work_dir.
@@ -1005,6 +1011,15 @@ func (e *Engine) SetShowWorkdirIndicator(show bool) {
 // no-ops.
 func (e *Engine) SetReplyFooterEnabled(show bool) {
 	e.replyFooterEnabled = show
+}
+
+// SetFooterTemplate sets a Go text/template for the CCD-style reply footer.
+// Available placeholders: {{.Model}}, {{.Effort}}, {{.Out}}, {{.In}},
+// {{.CW}}, {{.CR}}, {{.Ctx}}, {{.Elapsed}}, {{.Workdir}}.
+// Empty string resets to the built-in default format.
+func (e *Engine) SetFooterTemplate(tmpl string) {
+	e.footerTemplate = tmpl
+	e.footerTemplateTmpl = nil // force re-parse on next use
 }
 
 // SetFilterExternalSessions controls whether /list, /switch, /delete, etc.
@@ -5931,7 +5946,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 						footerContext = fmt.Sprintf("[ctx: ~%d%%]", selfPct)
 					}
 				}
-				if status := e.buildClaudeStatusLineFooter(replyAgent, state.agentSession, workspaceDir); status != "" {
+				if status := e.buildClaudeStatusLineFooter(replyAgent, state.agentSession, workspaceDir, turnStart); status != "" {
 					statusFooter = status
 				} else if footer := e.buildReplyFooter(replyAgent, state.agentSession, workspaceDir, footerContext); footer != "" {
 					statusFooter = footer
@@ -7862,13 +7877,16 @@ func replyFooterHomeRelativePath(path, home string) (string, bool) {
 // buildClaudeStatusLineFooter renders a CCD-statusline-style footer for the
 // reply, composed of two lines:
 //
-//	line 1 (controlled by show_context_indicator): <model id> · [effort:X ·] out N · in N cw N cr N · ctx N%
+//	line 1 (controlled by show_context_indicator): <model id> · [effort:X ·] out N · in N cw N cr N · ctx N% · elapsed
 //	line 2 (controlled by show_workdir_indicator): <workspace dir>
+//
+// If e.footerTemplate is set, the footer is rendered via Go text/template
+// instead of the built-in format.
 //
 // Returns "" if reply_footer is disabled, or if the active session does not
 // expose per-turn cache-token data (i.e. this is not claudecode or no result
 // event has arrived yet) so callers fall back to the default footer.
-func (e *Engine) buildClaudeStatusLineFooter(agent Agent, session AgentSession, workspaceDir string) string {
+func (e *Engine) buildClaudeStatusLineFooter(agent Agent, session AgentSession, workspaceDir string, turnStart time.Time) string {
 	if !e.replyFooterEnabled {
 		return ""
 	}
@@ -7887,57 +7905,96 @@ func (e *Engine) buildClaudeStatusLineFooter(agent Agent, session AgentSession, 
 		return ""
 	}
 
+	// Compute common fields up front (used by both template and default paths).
+	model := strings.TrimSpace(replyFooterModel(session, agent))
+	effort := strings.TrimSpace(replyFooterReasoningEffort(session, agent))
+	workdir := replyFooterWorkDir(session, agent, workspaceDir)
+
+	// Elapsed duration since turn started.
+	var elapsed string
+	if !turnStart.IsZero() {
+		elapsed = time.Since(turnStart).Truncate(time.Second).String()
+	}
+
+	// Context-window percentage.
+	used := usage.UsedTokens
+	if used <= 0 {
+		used = usage.InputTokens + usage.CachedInputTokens + usage.CacheCreationInputTokens
+	}
+	pct := int(math.Round(float64(used) * 100 / float64(usage.ContextWindow)))
+	if pct < 0 {
+		pct = 0
+	}
+	if pct > 100 {
+		pct = 100
+	}
+	ctxPct := fmt.Sprintf("%d%%", pct)
+
+	// Token counts as formatted strings.
+	outStr := formatStatusTokenCount(usage.OutputTokens)
+	inStr := formatStatusTokenCount(usage.InputTokens)
+	cwStr := formatStatusTokenCount(usage.CacheCreationInputTokens)
+	crStr := formatStatusTokenCount(usage.CachedInputTokens)
+
+	// Template path: render via user-supplied Go template.
+	if e.footerTemplate != "" {
+		data := footerTemplateData{
+			Model:   model,
+			Effort:  effort,
+			Out:     outStr,
+			In:      inStr,
+			CW:      cwStr,
+			CR:      crStr,
+			Ctx:     ctxPct,
+			Elapsed: elapsed,
+			Workdir: workdir,
+		}
+		if s := e.renderFooterTemplate(data); s != "" {
+			return s
+		}
+		// Template parse/render failure → fall through to built-in default.
+	}
+
+	// Built-in default format.
 	var line1 string
 	if e.showContextIndicator {
-		used := usage.UsedTokens
-		if used <= 0 {
-			used = usage.InputTokens + usage.CachedInputTokens + usage.CacheCreationInputTokens
-		}
-		pct := int(math.Round(float64(used) * 100 / float64(usage.ContextWindow)))
-		if pct < 0 {
-			pct = 0
-		}
-		if pct > 100 {
-			pct = 100
-		}
-
 		// Compose:
-		//   <model id> · [effort:X ·] out N · in N cw N cr N · ctx N%
+		//   <model id> · [effort:X ·] out N · in N cw N cr N · ctx N% · <elapsed>
 		// `·` separates major segments; tokens-in tier (in/cw/cr) groups under
 		// one segment because cw/cr are just cache-tiered variants of input.
 		// Raw model id is preserved (e.g. "claude-opus-4-7[1m]") for diagnostic
 		// clarity over a prettified display name.
 		var line1Parts []string
-		if model := strings.TrimSpace(replyFooterModel(session, agent)); model != "" {
+		if model != "" {
 			line1Parts = append(line1Parts, model)
 		}
-		if effort := strings.TrimSpace(replyFooterReasoningEffort(session, agent)); effort != "" {
+		if effort != "" {
 			line1Parts = append(line1Parts, "effort:"+effort)
 		}
 		if usage.OutputTokens > 0 {
-			line1Parts = append(line1Parts, fmt.Sprintf("out %s", formatStatusTokenCount(usage.OutputTokens)))
+			line1Parts = append(line1Parts, fmt.Sprintf("out %s", outStr))
 		}
 		switch {
 		case hasCacheTokens:
 			// Anthropic path: keep the CCD-style "in X cw Y cr Z" grouping
 			// (zero tiers still shown) once any cache tier is present.
-			line1Parts = append(line1Parts, fmt.Sprintf("in %s cw %s cr %s",
-				formatStatusTokenCount(usage.InputTokens),
-				formatStatusTokenCount(usage.CacheCreationInputTokens),
-				formatStatusTokenCount(usage.CachedInputTokens)))
+			line1Parts = append(line1Parts, fmt.Sprintf("in %s cw %s cr %s", inStr, cwStr, crStr))
 		case usage.InputTokens > 0:
 			// Cache-less agents (ACP/Hermes, …): plain input count, no cw/cr.
-			line1Parts = append(line1Parts, fmt.Sprintf("in %s", formatStatusTokenCount(usage.InputTokens)))
+			line1Parts = append(line1Parts, fmt.Sprintf("in %s", inStr))
 		}
 		if used > 0 {
-			line1Parts = append(line1Parts, fmt.Sprintf("ctx %d%%", pct))
+			line1Parts = append(line1Parts, fmt.Sprintf("ctx %s", ctxPct))
+		}
+		if elapsed != "" {
+			line1Parts = append(line1Parts, elapsed)
 		}
 		line1 = strings.Join(line1Parts, " · ")
 	}
 
 	var line2 string
 	if e.showWorkdirIndicator {
-		line2 = replyFooterWorkDir(session, agent, workspaceDir)
+		line2 = workdir
 	}
 
 	switch {
@@ -7950,6 +8007,46 @@ func (e *Engine) buildClaudeStatusLineFooter(agent Agent, session AgentSession, 
 	default:
 		return ""
 	}
+}
+
+// footerTemplateData holds the placeholder values available to a custom
+// footer template. All fields are pre-formatted strings ready for display.
+type footerTemplateData struct {
+	Model   string // model id (e.g. "claude-opus-4-7[1m]")
+	Effort  string // reasoning effort (e.g. "xhigh"), empty if unset
+	Out     string // output token count (e.g. "1.2k")
+	In      string // input token count
+	CW      string // cache-creation input token count
+	CR      string // cached-input token count
+	Ctx     string // context-window percentage (e.g. "4%")
+	Elapsed string // elapsed wall-clock since turn start (e.g. "12s")
+	Workdir string // workspace directory path
+}
+
+// defaultFooterTemplate is the built-in Go template equivalent to the
+// hard-coded footer format. It is used as a reference and could be offered
+// as a starting point for users who want to customise.
+const defaultFooterTemplate = `{{if .Model}}{{.Model}}{{end}}{{if .Effort}} · effort:{{.Effort}}{{end}}{{if .Out}} · out {{.Out}}{{end}} · in {{.In}}{{if ne .CW "0"}} cw {{.CW}}{{end}}{{if ne .CR "0"}} cr {{.CR}}{{end}}{{if .Ctx}} · ctx {{.Ctx}}{{end}}{{if .Elapsed}} · {{.Elapsed}}{{end}}{{if .Workdir}}
+{{.Workdir}}{{end}}`
+
+// renderFooterTemplate parses (lazily) and executes e.footerTemplate with the
+// given data. Returns "" on any error (parse or execution), allowing callers
+// to fall back gracefully.
+func (e *Engine) renderFooterTemplate(data footerTemplateData) string {
+	if e.footerTemplateTmpl == nil {
+		t, err := template.New("footer").Parse(e.footerTemplate)
+		if err != nil {
+			slog.Warn("footer template parse error, falling back to default", "error", err)
+			return ""
+		}
+		e.footerTemplateTmpl = t
+	}
+	var buf strings.Builder
+	if err := e.footerTemplateTmpl.Execute(&buf, data); err != nil {
+		slog.Warn("footer template execute error, falling back to default", "error", err)
+		return ""
+	}
+	return strings.TrimSpace(buf.String())
 }
 
 // sendChunksWithStatusFooter splits body across maxPlatformMessageLen and sends
@@ -10558,51 +10655,21 @@ func (e *Engine) stopInteractiveSessionWithOptions(sessionKey string, notifyQueu
 	state.mu.Unlock()
 
 	// If the agent session supports graceful turn cancellation (e.g. ACP),
-	// send a cancel notification and keep the session alive for the next
-	// user message, rather than killing the process and destroying state.
+	// send a cancel notification to stop the current turn, then fall through
+	// to normalCleanup to kill the process. This matches Claude Code behavior:
+	// /stop kills the process, next message spawns a fresh one and resumes
+	// the session from persisted history. Keeping the process alive after
+	// cancel leaves the agent in a broken state (json-rpc -32603).
 	if canceller, ok := agentSession.(AgentSessionCanceller); ok && agentSession != nil {
-		// Keep the state in the map so the next message reuses this session.
-		// Don't markStopped — the session is still usable.
-		// Don't delete from interactiveStates — keep it alive.
-		e.interactiveMu.Unlock()
-
-		if pending != nil {
-			pending.resolve()
-		}
-		if notifyQueued {
-			e.notifyDroppedQueuedMessages(state, fmt.Errorf("session cancelled"))
+		if cancelErr := canceller.CancelTurn(); cancelErr != nil {
+			slog.Debug("agent session CancelTurn failed during stop", "session_key", sessionKey, "error", cancelErr)
 		} else {
-			state.mu.Lock()
-			state.pendingMessages = nil
-			state.mu.Unlock()
+			slog.Info("agent session turn cancelled, killing process for clean restart", "session_key", sessionKey)
 		}
-
-		// Mark eventsNeedResync so the next turn drains stale events from
-		// the cancelled turn before processing fresh input.
-		state.mu.Lock()
-		state.eventsNeedResync = true
-		state.mu.Unlock()
-
-		cancelErr := canceller.CancelTurn()
-		if cancelErr != nil {
-			slog.Warn("agent session CancelTurn failed, falling back to Close",
-				"session_key", sessionKey, "error", cancelErr)
-			// Fall through to normal cleanup below.
-			goto normalCleanup
-		}
-
-		slog.Info("agent session turn cancelled, session kept alive",
-			"session_key", sessionKey)
-
-		e.hooks.Emit(HookEvent{
-			Event:      HookEventSessionEnded,
-			SessionKey: sessionKey,
-		})
-
-		return true
+		// Fall through to normalCleanup to kill the process and delete state.
+		// The next message will spawn a fresh process and resume the session.
 	}
 
-normalCleanup:
 	state.markStopped()
 	delete(e.interactiveStates, sessionKey)
 	e.interactiveMu.Unlock()

@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // newClaudeFooterEngine returns an Engine with all three footer-related flags
@@ -41,7 +42,7 @@ func TestBuildClaudeStatusLineFooter_NilUsage(t *testing.T) {
 		workDir: "/tmp/ws",
 	}
 	e := newClaudeFooterEngine()
-	if got := e.buildClaudeStatusLineFooter(nil, session, "/tmp/ws"); got != "" {
+	if got := e.buildClaudeStatusLineFooter(nil, session, "/tmp/ws", time.Time{}); got != "" {
 		t.Errorf("expected empty footer for nil usage, got %q", got)
 	}
 }
@@ -61,7 +62,7 @@ func TestBuildClaudeStatusLineFooter_NoCacheTokens(t *testing.T) {
 		},
 	}
 	e := newClaudeFooterEngine()
-	got := e.buildClaudeStatusLineFooter(nil, session, "/tmp/ws")
+	got := e.buildClaudeStatusLineFooter(nil, session, "/tmp/ws", time.Time{})
 	if got == "" {
 		t.Fatal("expected footer for cache-less agent, got empty")
 	}
@@ -91,7 +92,7 @@ func TestBuildClaudeStatusLineFooter_WindowOccupancyOnlyFallsThrough(t *testing.
 		},
 	}
 	e := newClaudeFooterEngine()
-	if got := e.buildClaudeStatusLineFooter(nil, session, "/tmp/ws"); got != "" {
+	if got := e.buildClaudeStatusLineFooter(nil, session, "/tmp/ws", time.Time{}); got != "" {
 		t.Errorf("window-only usage must fall through to legacy footer, got %q", got)
 	}
 }
@@ -110,7 +111,7 @@ func TestBuildClaudeStatusLineFooter_FullRender(t *testing.T) {
 		},
 	}
 	e := newClaudeFooterEngine()
-	got := e.buildClaudeStatusLineFooter(nil, session, "/tmp/ws")
+	got := e.buildClaudeStatusLineFooter(nil, session, "/tmp/ws", time.Time{})
 	// 41772 / 1_000_000 = 4.17% → rounds to 4%.
 	// Output is two lines:
 	//   line 1: <model id> · out N · in N cw N cr N · ctx N%
@@ -157,7 +158,7 @@ func TestBuildClaudeStatusLineFooter_FooterDisabled(t *testing.T) {
 	}
 	e := newClaudeFooterEngine()
 	e.SetReplyFooterEnabled(false)
-	if got := e.buildClaudeStatusLineFooter(nil, session, "/tmp/ws"); got != "" {
+	if got := e.buildClaudeStatusLineFooter(nil, session, "/tmp/ws", time.Time{}); got != "" {
 		t.Errorf("reply_footer=false must suppress footer, got %q", got)
 	}
 }
@@ -179,7 +180,7 @@ func TestBuildClaudeStatusLineFooter_HideContextLine(t *testing.T) {
 	}
 	e := newClaudeFooterEngine()
 	e.SetShowContextIndicator(false)
-	got := e.buildClaudeStatusLineFooter(nil, session, "/tmp/ws")
+	got := e.buildClaudeStatusLineFooter(nil, session, "/tmp/ws", time.Time{})
 	if strings.Contains(got, "\n") {
 		t.Errorf("line 1 should be hidden — got multi-line footer: %q", got)
 	}
@@ -208,7 +209,7 @@ func TestBuildClaudeStatusLineFooter_HideWorkdirLine(t *testing.T) {
 	}
 	e := newClaudeFooterEngine()
 	e.SetShowWorkdirIndicator(false)
-	got := e.buildClaudeStatusLineFooter(nil, session, "/tmp/ws")
+	got := e.buildClaudeStatusLineFooter(nil, session, "/tmp/ws", time.Time{})
 	if strings.Contains(got, "\n") {
 		t.Errorf("line 2 should be hidden — got multi-line footer: %q", got)
 	}
@@ -238,7 +239,7 @@ func TestBuildClaudeStatusLineFooter_HideBothLines(t *testing.T) {
 	e := newClaudeFooterEngine()
 	e.SetShowContextIndicator(false)
 	e.SetShowWorkdirIndicator(false)
-	if got := e.buildClaudeStatusLineFooter(nil, session, "/tmp/ws"); got != "" {
+	if got := e.buildClaudeStatusLineFooter(nil, session, "/tmp/ws", time.Time{}); got != "" {
 		t.Errorf("both lines hidden should yield empty footer, got %q", got)
 	}
 }

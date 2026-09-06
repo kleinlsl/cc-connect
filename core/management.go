@@ -28,6 +28,7 @@ type ProjectSettingsUpdate struct {
 	ShowContextIndicator *bool
 	ShowWorkdirIndicator *bool
 	ReplyFooter          *bool
+	FooterTemplate       *string
 	InjectSender         *bool
 	PlatformAllowFrom    map[string]string
 }
@@ -748,6 +749,7 @@ func (m *ManagementServer) handleProjectDetail(w http.ResponseWriter, r *http.Re
 			ShowContextIndicator *bool             `json:"show_context_indicator"`
 			ShowWorkdirIndicator *bool             `json:"show_workdir_indicator"`
 			ReplyFooter          *bool             `json:"reply_footer"`
+			FooterTemplate       *string           `json:"footer_template"`
 			InjectSender         *bool             `json:"inject_sender"`
 			PlatformAllowFrom    map[string]string `json:"platform_allow_from"`
 		}
@@ -803,6 +805,9 @@ func (m *ManagementServer) handleProjectDetail(w http.ResponseWriter, r *http.Re
 		if body.ReplyFooter != nil {
 			e.SetReplyFooterEnabled(*body.ReplyFooter)
 		}
+		if body.FooterTemplate != nil {
+			e.SetFooterTemplate(*body.FooterTemplate)
+		}
 		if body.InjectSender != nil {
 			e.SetInjectSender(*body.InjectSender)
 		}
@@ -835,6 +840,7 @@ func (m *ManagementServer) handleProjectDetail(w http.ResponseWriter, r *http.Re
 				ShowContextIndicator: body.ShowContextIndicator,
 				ShowWorkdirIndicator: body.ShowWorkdirIndicator,
 				ReplyFooter:          body.ReplyFooter,
+				FooterTemplate:       body.FooterTemplate,
 				InjectSender:         body.InjectSender,
 				PlatformAllowFrom:    body.PlatformAllowFrom,
 			}

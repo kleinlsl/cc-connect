@@ -739,6 +739,13 @@ name = "my-backend"
 #                                   # 隐藏 footer 第一行：model · [effort ·] out/in/cw/cr · ctx %（默认 true 显示）
 # show_workdir_indicator = false   # Hide the footer's second line: workspace directory (default: true)
 #                                   # 隐藏 footer 第二行：工作区目录（默认 true 显示）
+# footer_template = "{{.Model}} · {{.Out}} · {{.In}} · ctx {{.Ctx}} · {{.Elapsed}}"
+#                   # Custom Go text/template for the CCD-style reply footer.
+#                   # Placeholders: {{.Model}}, {{.Effort}}, {{.Out}}, {{.In}},
+#                   # {{.CW}}, {{.CR}}, {{.Ctx}}, {{.Elapsed}}, {{.Workdir}}.
+#                   # 自定义 CCD 风格回复 footer 的 Go 模板。
+#                   # 占位符：{{.Model}}, {{.Effort}}, {{.Out}}, {{.In}},
+#                   # {{.CW}}, {{.CR}}, {{.Ctx}}, {{.Elapsed}}, {{.Workdir}}。
 # disabled_commands = ["restart", "upgrade", "cron"]  # Disable specific commands for this project
 #                                                     # 禁用该项目的指定命令
 #

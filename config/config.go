@@ -526,6 +526,10 @@ type ProjectConfig struct {
 	// ReplyFooter: nil/true = render the reply footer; false = disable it
 	// entirely (the per-line indicator flags above become no-ops).
 	ReplyFooter      *bool        `toml:"reply_footer,omitempty"`
+	// FooterTemplate is a Go text/template string for the CCD-style reply footer.
+	// Available placeholders: {{.Model}}, {{.Effort}}, {{.Out}},
+	// {{.In}}, {{.CW}}, {{.CR}}, {{.Ctx}}, {{.Elapsed}}, {{.Workdir}}.
+	FooterTemplate *string `toml:"footer_template,omitempty"`
 	InjectSender     *bool        `toml:"inject_sender,omitempty"`     // prepend sender identity (platform + user ID) to each message sent to the agent
 	DisabledCommands []string     `toml:"disabled_commands,omitempty"` // commands to disable for this project (e.g. ["restart", "upgrade"])
 	AdminFrom        string       `toml:"admin_from,omitempty"`        // comma-separated user IDs allowed to run privileged commands; "*" = all allowed users
@@ -3386,6 +3390,7 @@ type ProjectSettingsUpdate struct {
 	ShowContextIndicator *bool
 	ShowWorkdirIndicator *bool
 	ReplyFooter          *bool
+	FooterTemplate       *string
 	InjectSender         *bool
 	PlatformAllowFrom    map[string]string
 }
@@ -3471,6 +3476,9 @@ func SaveProjectSettings(projectName string, update ProjectSettingsUpdate) error
 		if update.ReplyFooter != nil {
 			v := *update.ReplyFooter
 			proj.ReplyFooter = &v
+		}
+		if update.FooterTemplate != nil {
+			proj.FooterTemplate = update.FooterTemplate
 		}
 		if update.InjectSender != nil {
 			v := *update.InjectSender
@@ -3559,6 +3567,9 @@ func GetProjectConfigDetails(projectName string) map[string]any {
 		}
 		if p.ReplyFooter != nil {
 			result["reply_footer"] = *p.ReplyFooter
+		}
+		if p.FooterTemplate != nil {
+			result["footer_template"] = *p.FooterTemplate
 		}
 		if p.InjectSender != nil {
 			result["inject_sender"] = *p.InjectSender

@@ -429,6 +429,9 @@ func main() {
 		}
 		engine.SetShowWorkdirIndicator(showWorkdir)
 		engine.SetReplyFooterEnabled(showFooter)
+		if proj.FooterTemplate != nil {
+			engine.SetFooterTemplate(*proj.FooterTemplate)
+		}
 		engine.SetAttachmentSendEnabled(cfg.AttachmentSend != "off")
 		engine.SetFilterExternalSessions(proj.FilterExternalSessions != nil && *proj.FilterExternalSessions)
 		engine.SetBaseWorkDir(workDir)
@@ -1185,6 +1188,7 @@ func main() {
 				ShowContextIndicator: u.ShowContextIndicator,
 				ShowWorkdirIndicator: u.ShowWorkdirIndicator,
 				ReplyFooter:          u.ReplyFooter,
+				FooterTemplate:       u.FooterTemplate,
 				InjectSender:         u.InjectSender,
 				PlatformAllowFrom:    u.PlatformAllowFrom,
 			})
@@ -1784,6 +1788,9 @@ func reloadConfig(configPath, projName string, engine *core.Engine) (*core.Confi
 	}
 	engine.SetShowWorkdirIndicator(showWorkdir)
 	engine.SetReplyFooterEnabled(showFooter)
+	if proj.FooterTemplate != nil {
+		engine.SetFooterTemplate(*proj.FooterTemplate)
+	}
 
 	// Reload auto-compress settings
 	if proj.AutoCompress.Enabled != nil && *proj.AutoCompress.Enabled {
