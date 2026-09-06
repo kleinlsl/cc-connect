@@ -25,11 +25,11 @@ const ExplicitActivationTTL = 7 * 24 * time.Hour
 
 // Session tracks one conversation between a user and the agent.
 type Session struct {
-	ID                  string         `json:"id"`
-	Name                string         `json:"name"`
-	AgentSessionID      string         `json:"agent_session_id"`
-	AgentType           string         `json:"agent_type,omitempty"`
-	PastAgentSessionIDs []string       `json:"past_agent_session_ids,omitempty"`
+	ID                  string   `json:"id"`
+	Name                string   `json:"name"`
+	AgentSessionID      string   `json:"agent_session_id"`
+	AgentType           string   `json:"agent_type,omitempty"`
+	PastAgentSessionIDs []string `json:"past_agent_session_ids,omitempty"`
 	// ActiveProvider is the agent provider name that was active when this
 	// session last took a turn. It is restored before --resume so that a
 	// cc-connect process restart does not silently drop a user's
@@ -320,14 +320,15 @@ type sessionSnapshot struct {
 // SessionManager supports multiple named sessions per user with active-session tracking.
 // It can persist state to a JSON file and reload on startup.
 type SessionManager struct {
-	mu            sync.RWMutex
-	sessions      map[string]*Session
-	activeSession map[string]string
-	userSessions  map[string][]string
-	sessionNames  map[string]string    // agent session ID → custom name
-	userMeta      map[string]*UserMeta // sessionKey → display info
-	counter       int64
-	storePath     string // empty = no persistence
+	mu             sync.RWMutex
+	sessions       map[string]*Session
+	activeSession  map[string]string
+	userSessions   map[string][]string
+	sessionNames   map[string]string    // agent session ID → custom name
+	userMeta       map[string]*UserMeta // sessionKey → display info
+	counter        int64
+	storePath      string // empty = no persistence
+	persistStopped bool   // set by StopPersistence; later saves are no-ops
 
 	// legacyData is true when sessions were loaded from a snapshot that
 	// predates PastAgentSessionIDs tracking. In this state, many sessions
@@ -665,8 +666,16 @@ func (sm *SessionManager) Save() {
 	sm.saveLocked()
 }
 
+// StopPersistence makes every later saveLocked a no-op. Engine.Stop calls it
+// so background goroutines can no longer write the sessions file during shutdown.
+func (sm *SessionManager) StopPersistence() {
+	sm.mu.Lock()
+	sm.persistStopped = true
+	sm.mu.Unlock()
+}
+
 func (sm *SessionManager) saveLocked() {
-	if sm.storePath == "" {
+	if sm.storePath == "" || sm.persistStopped {
 		return
 	}
 
@@ -876,7 +885,7 @@ func (sm *SessionManager) PruneDuplicateSessions(mergeHistory bool) PruneResult 
 	defer sm.mu.Unlock()
 
 	// Group sessions by baseChat
-	chatSessions := make(map[string][]*Session) // baseChat -> sessions
+	chatSessions := make(map[string][]*Session)  // baseChat -> sessions
 	sessionToBaseChat := make(map[string]string) // session.ID -> baseChat
 
 	for userKey, sessionIDs := range sm.userSessions {

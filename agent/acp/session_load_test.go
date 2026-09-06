@@ -7,6 +7,7 @@ import (
 	"io"
 	"sync"
 	"testing"
+	"time"
 )
 
 // mockHandshakeServer replies to the JSON-RPC methods the acp handshake emits.
@@ -133,5 +134,83 @@ func TestHandshake_ResumeLoadError_FallsBackToNew(t *testing.T) {
 	}
 	if !containsMethod(methods, "session/new") {
 		t.Fatalf("expected session/new fallback, methods=%v", methods)
+	}
+}
+
+// Regression for a handshake self-deadlock. Hermes replays the ENTIRE prior
+// conversation as session/update notifications BEFORE it returns the
+// session/load response. Before the fix onNotification emitted every replay
+// event into the bounded events channel while the engine (which only drains
+// Events() after StartSession returns) was still blocked inside handshake;
+// once the replay exceeded the channel buffer, readLoop stalled, the load
+// response was never read and handshake hung forever (stalling the whole
+// engine, so later messages in any chat stopped being processed). The fix
+// drops replay updates until the handshake completes. This test hangs/fails
+// on the old code and passes after.
+func TestHandshake_ResumeLoadReplayDoesNotDeadlock(t *testing.T) {
+	cb := &fakeCallbacks{}
+	s, wResp, rReq := newTestSession(t, cb) // events channel cap = 32
+	s.acpSessID = ""
+
+	const replayN = 80 // deliberately larger than the 32-slot events buffer
+	go func() {
+		sc := bufio.NewScanner(rReq)
+		sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+		for sc.Scan() {
+			var req map[string]any
+			if json.Unmarshal(sc.Bytes(), &req) != nil {
+				continue
+			}
+			method, _ := req["method"].(string)
+			id := req["id"]
+			switch method {
+			case "initialize":
+				fmt.Fprintf(wResp, `{"jsonrpc":"2.0","id":%v,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true}}}`+"\n", id)
+			case "session/load":
+				// Flood replay updates BEFORE the load response, like Hermes does.
+				for i := 0; i < replayN; i++ {
+					fmt.Fprintf(wResp, `{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"restored","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"replay-%d"}}}}`+"\n", i)
+				}
+				fmt.Fprintf(wResp, `{"jsonrpc":"2.0","id":%v,"result":{"modes":{"currentModeId":"default","availableModes":[]}}}`+"\n", id)
+			case "session/new":
+				fmt.Fprintf(wResp, `{"jsonrpc":"2.0","id":%v,"result":{"sessionId":"brand-new-id"}}`+"\n", id)
+			default:
+				fmt.Fprintf(wResp, `{"jsonrpc":"2.0","id":%v,"result":{}}`+"\n", id)
+			}
+		}
+	}()
+
+	done := make(chan error, 1)
+	go func() { done <- s.handshake("restored", "") }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("handshake resume: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("handshake deadlocked: replay overflowed the events channel and the session/load response was never consumed")
+	}
+
+	if got := s.currentACPSessionID(); got != "restored" {
+		t.Fatalf("acp session id = %q, want restored", got)
+	}
+
+	// Replay must not have leaked into the live event stream.
+	select {
+	case ev := <-s.events:
+		t.Fatalf("history replay leaked a live event during handshake: %+v", ev)
+	default:
+	}
+
+	// Once the handshake is done, live updates flow normally again.
+	s.onNotification("session/update", json.RawMessage(
+		`{"sessionId":"restored","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"live"}}}`))
+	select {
+	case ev := <-s.events:
+		if ev.Content != "live" {
+			t.Fatalf("post-handshake live event content = %q, want live", ev.Content)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("live session/update after handshake must be emitted")
 	}
 }

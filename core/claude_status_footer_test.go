@@ -47,10 +47,11 @@ func TestBuildClaudeStatusLineFooter_NilUsage(t *testing.T) {
 }
 
 func TestBuildClaudeStatusLineFooter_NoCacheTokens(t *testing.T) {
-	// Other agents (codex/gemini) populate ContextUsage without cache
-	// tokens; we must NOT emit the claude-style footer for them.
+	// Cache-less agents (ACP/Hermes, codex, gemini) populate ContextUsage
+	// without prompt-cache tiers: the footer still renders, but the token
+	// segment must be plain "in N" — never the cw/cr grouping.
 	session := &controllableAgentSession{
-		model:   "claude-opus-4-7[1m]",
+		model:   "glm-5.3-flash",
 		workDir: "/tmp/ws",
 		contextUsage: &ContextUsage{
 			InputTokens:   1000,
@@ -60,8 +61,38 @@ func TestBuildClaudeStatusLineFooter_NoCacheTokens(t *testing.T) {
 		},
 	}
 	e := newClaudeFooterEngine()
+	got := e.buildClaudeStatusLineFooter(nil, session, "/tmp/ws")
+	if got == "" {
+		t.Fatal("expected footer for cache-less agent, got empty")
+	}
+	lines := strings.Split(got, "\n")
+	line1 := lines[0]
+	for _, want := range []string{"glm-5.3-flash", "out 200", "in 1.0k"} {
+		if !strings.Contains(line1, want) {
+			t.Errorf("line1 %q missing %q", line1, want)
+		}
+	}
+	if strings.Contains(line1, "cw ") || strings.Contains(line1, "cr ") {
+		t.Errorf("cache-less footer must not render cw/cr: %q", line1)
+	}
+}
+
+// TestBuildClaudeStatusLineFooter_WindowOccupancyOnlyFallsThrough covers an
+// agent that reports only window occupancy (UsedTokens/ContextWindow) but no
+// per-turn input/output tokens and no cache tiers: it must fall through to the
+// legacy single-line quota footer instead of rendering a token-less CCD line.
+func TestBuildClaudeStatusLineFooter_WindowOccupancyOnlyFallsThrough(t *testing.T) {
+	session := &controllableAgentSession{
+		model:   "gpt-5.4",
+		workDir: "/tmp/ws",
+		contextUsage: &ContextUsage{
+			UsedTokens:    181424,
+			ContextWindow: 258400,
+		},
+	}
+	e := newClaudeFooterEngine()
 	if got := e.buildClaudeStatusLineFooter(nil, session, "/tmp/ws"); got != "" {
-		t.Errorf("expected empty footer when cache tokens absent, got %q", got)
+		t.Errorf("window-only usage must fall through to legacy footer, got %q", got)
 	}
 }
 

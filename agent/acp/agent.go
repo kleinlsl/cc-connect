@@ -34,6 +34,22 @@ type Agent struct {
 	// session/new. Empty means "use whatever the agent selects by default".
 	mode string
 
+	// compressCommand is the native context-compression slash command this
+	// ACP server understands over a normal session/prompt (e.g. "/compress"
+	// for Hermes). Empty means the server has no such command and cc-connect
+	// reports compression as unsupported (ContextCompressor). It is config-
+	// driven because the generic ACP adapter must not hard-code one vendor's
+	// command name.
+	compressCommand string
+
+	// modelCommand is the native slash command this ACP server uses to switch
+	// the running session's model over a normal session/prompt (e.g. "/model"
+	// for Hermes). Empty means the server has no such command and cc-connect
+	// falls back to the structured ModelSwitcher path / "not supported". It is
+	// config-driven because the generic ACP adapter must not hard-code one
+	// vendor's command name.
+	modelCommand string
+
 	// listUnsupported caches a negative result after we probe the agent
 	// for sessionCapabilities.list once. Eliminates spawn cost on
 	// subsequent `/ls` invocations against agents that don't implement
@@ -45,9 +61,9 @@ type Agent struct {
 	// handshake so that future PermissionModes() calls can reflect the
 	// actual modes this specific ACP agent offers (rather than a
 	// hard-coded fallback that may not match).
-	modesMu       sync.RWMutex
-	modesCache    []core.PermissionModeInfo
-	modesCurrent  string
+	modesMu      sync.RWMutex
+	modesCache   []core.PermissionModeInfo
+	modesCurrent string
 
 	mu sync.RWMutex
 }
@@ -93,17 +109,23 @@ func New(opts map[string]any) (core.Agent, error) {
 	}
 	mode, _ := opts["mode"].(string)
 	mode = strings.TrimSpace(mode)
+	compressCommand, _ := opts["compress_command"].(string)
+	compressCommand = strings.TrimSpace(compressCommand)
+	modelCommand, _ := opts["model_command"].(string)
+	modelCommand = strings.TrimSpace(modelCommand)
 
 	return &Agent{
-		workDir:     workDir,
-		cmd:          cmdStr,
-		cliExtraArgs: cliExtraArgs,
-		args:        args,
-		staticEnv:   staticEnv,
-		extraEnv:    extra,
-		authMethod:  authMethod,
-		displayName: displayName,
-		mode:        mode,
+		workDir:         workDir,
+		cmd:             cmdStr,
+		cliExtraArgs:    cliExtraArgs,
+		args:            args,
+		staticEnv:       staticEnv,
+		extraEnv:        extra,
+		authMethod:      authMethod,
+		displayName:     displayName,
+		mode:            mode,
+		compressCommand: compressCommand,
+		modelCommand:    modelCommand,
 	}, nil
 }
 
@@ -213,6 +235,12 @@ func (a *Agent) WorkspaceAgentOptions() map[string]any {
 	if a.displayName != "" {
 		opts["display_name"] = a.displayName
 	}
+	if a.compressCommand != "" {
+		opts["compress_command"] = a.compressCommand
+	}
+	if a.modelCommand != "" {
+		opts["model_command"] = a.modelCommand
+	}
 	return opts
 }
 
@@ -246,6 +274,40 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 }
 
 func (a *Agent) Stop() error { return nil }
+
+// -- ContextCompressor --
+//
+// ACP servers vary in whether they accept a context-compression slash
+// command over a plain session/prompt, and in what it is called, so the
+// command is supplied via the agent option "compress_command" (e.g.
+// "/compress" for Hermes). Returning "" makes the engine report that
+// compression is unsupported, preserving the default behaviour for ACP
+// servers without such a command.
+
+var _ core.ContextCompressor = (*Agent)(nil)
+
+// CompressCommand returns the configured native compression command.
+func (a *Agent) CompressCommand() string {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.compressCommand
+}
+
+// -- ModelCommand --
+//
+// ACP servers differ in how (or whether) they switch the running session's
+// model, so the command is supplied via the agent option "model_command"
+// (e.g. "/model" for Hermes). Returning "" leaves /model on cc-connect's
+// structured ModelSwitcher / "not supported" path.
+
+var _ core.ModelCommand = (*Agent)(nil)
+
+// ModelCommand returns the configured native runtime model-switch command.
+func (a *Agent) ModelCommand() string {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.modelCommand
+}
 
 // -- AgentDoctorInfo --
 

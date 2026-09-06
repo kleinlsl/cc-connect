@@ -9841,6 +9841,15 @@ type stubCompressorAgent struct {
 
 func (a *stubCompressorAgent) CompressCommand() string { return a.cmd }
 
+// stubModelCommandAgent opts into native slash-command model switching
+// (core.ModelCommand), like the ACP adapter configured with model_command.
+type stubModelCommandAgent struct {
+	stubAgent
+	cmd string
+}
+
+func (a *stubModelCommandAgent) ModelCommand() string { return a.cmd }
+
 func TestCmdCompress_NoCompressor_RepliesNotSupported(t *testing.T) {
 	p := &stubPlatformEngine{n: "test"}
 	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
@@ -10137,6 +10146,108 @@ func TestCmdCompress_Success_SendsCompressDone(t *testing.T) {
 		default:
 			time.Sleep(10 * time.Millisecond)
 		}
+	}
+}
+
+// --- /model forwarding (ModelCommand, e.g. ACP/Hermes) ---
+
+func TestCmdModel_ModelCommand_NoSession_RepliesNoSession(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	agent := &stubModelCommandAgent{cmd: "/model"}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+
+	msg := &Message{SessionKey: "test:user1", Content: "/model x", ReplyCtx: "ctx"}
+	e.cmdModel(p, msg, []string{"x"})
+
+	sent := p.getSent()
+	if len(sent) == 0 {
+		t.Fatal("expected a reply")
+	}
+	if !strings.Contains(sent[0], e.i18n.T(MsgModelNoSession)) {
+		t.Fatalf("expected MsgModelNoSession, got %q", sent[0])
+	}
+}
+
+// TestCmdModel_ModelCommand_ForwardsAndRelays verifies that an agent which
+// switches models via a native slash command gets "/model <args>" sent to the
+// live session and the agent's text result is relayed back (no structured
+// ModelSwitcher involvement).
+func TestCmdModel_ModelCommand_ForwardsAndRelays(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	sess := newQueuingSession("model-fwd")
+	agent := &stubModelCommandAgent{cmd: "/model"}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+
+	key := "test:user1"
+	state := &interactiveState{
+		agentSession: sess,
+		platform:     p,
+		replyCtx:     "ctx",
+	}
+	e.interactiveMu.Lock()
+	e.interactiveStates[key] = state
+	e.interactiveMu.Unlock()
+
+	msg := &Message{SessionKey: key, Content: "/model z-ai/glm-5.3-flash", ReplyCtx: "ctx"}
+	e.cmdModel(p, msg, []string{"z-ai/glm-5.3-flash"})
+
+	// Wait until the command reaches the agent session, then assert exact text.
+	deadline := time.After(3 * time.Second)
+	for {
+		sess.sendMu.Lock()
+		n := len(sess.sendCalls)
+		sess.sendMu.Unlock()
+		if n > 0 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("timed out waiting for forwarded /model Send")
+		default:
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	sess.sendMu.Lock()
+	gotCmd := sess.sendCalls[0]
+	sess.sendMu.Unlock()
+	if gotCmd != "/model z-ai/glm-5.3-flash" {
+		t.Fatalf("forwarded command = %q, want /model z-ai/glm-5.3-flash", gotCmd)
+	}
+
+	// Agent reports the switch; engine must relay that text to the platform.
+	sess.events <- Event{Type: EventResult, Content: "Model switched to: z-ai/glm-5.3-flash", Done: true}
+	for {
+		relayed := false
+		for _, s := range p.getSent() {
+			if strings.Contains(s, "Model switched to: z-ai/glm-5.3-flash") {
+				relayed = true
+			}
+		}
+		if relayed {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("timed out waiting for relayed model result, sent=%v", p.getSent())
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+}
+
+// TestCmdModel_NoSwitcher_RepliesNotSupported guards the original path: an
+// agent that implements neither ModelCommand nor ModelSwitcher still gets the
+// "not supported" reply (forwarding must not swallow it).
+func TestCmdModel_NoSwitcher_RepliesNotSupported(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+
+	msg := &Message{SessionKey: "test:user1", Content: "/model x", ReplyCtx: "ctx"}
+	e.cmdModel(p, msg, []string{"x"})
+
+	sent := p.getSent()
+	if len(sent) == 0 || !strings.Contains(sent[0], e.i18n.T(MsgModelNotSupported)) {
+		t.Fatalf("expected MsgModelNotSupported, got %v", sent)
 	}
 }
 

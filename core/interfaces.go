@@ -54,6 +54,26 @@ type ReplyContextReconstructor interface {
 	ReconstructReplyCtx(sessionKey string) (any, error)
 }
 
+// ReplyContextCodec is an optional interface for platforms whose reply context
+// can be round-trip serialized. It powers durable redelivery (the outbox):
+// when a final reply can't be delivered immediately, the engine persists the
+// encoded reply context together with the rendered reply and replays it after
+// connectivity returns or after a restart. Platforms that don't implement it
+// keep the legacy fire-and-forget send behaviour.
+type ReplyContextCodec interface {
+	EncodeReplyCtx(replyCtx any) ([]byte, error)
+	DecodeReplyCtx(encoded []byte) (any, error)
+}
+
+// SendErrorClassifier is an optional interface that classifies an outgoing
+// send failure as retryable (transient network / 5xx) or permanent (invalid
+// request, bot removed from the chat, missing permission, ...). Retryable
+// failures of a *final reply* are parked in the outbox for redelivery;
+// permanent failures and progress/side-channel sends are not retried.
+type SendErrorClassifier interface {
+	IsRetryableSendError(err error) bool
+}
+
 // RelayGroupVisibilityTarget is an optional interface for platforms that
 // want to customise the session key used when echoing relay request /
 // response messages into the group chat for visibility.  Platforms that
@@ -521,6 +541,17 @@ type ContextUsage struct {
 // that will be forwarded to the agent process. Return "" if not supported.
 type ContextCompressor interface {
 	CompressCommand() string
+}
+
+// ModelCommand is an optional interface for agents whose native runtime
+// model switching is driven by a slash command forwarded over the live
+// session (e.g. an ACP agent such as Hermes that understands "/model <name>"
+// and reports "Model switched to: ..." as text). ModelCommand returns the
+// base command (e.g. "/model"); the engine appends any user-supplied args.
+// Return "" when the agent instead implements the structured ModelSwitcher
+// interface. Agents that implement neither keep the "not supported" reply.
+type ModelCommand interface {
+	ModelCommand() string
 }
 
 // AgentSessionCanceller is an optional interface for agent sessions that support

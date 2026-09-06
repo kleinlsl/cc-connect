@@ -18,6 +18,13 @@ import (
 	"github.com/chenhg5/cc-connect/core"
 )
 
+// acpSession reports per-turn context usage and its current model id so the
+// engine can render the same reply status footer as claudecode.
+var (
+	_ core.ContextUsageReporter      = (*acpSession)(nil)
+	_ interface{ GetModel() string } = (*acpSession)(nil)
+)
+
 // toolInputCacheMaxEntries caps toolInputByID growth; beyond this we evict
 // roughly half the map (iteration order is arbitrary) to bound memory.
 const toolInputCacheMaxEntries = 1000
@@ -29,6 +36,16 @@ type acpSession struct {
 	cancel  context.CancelFunc
 	wg      sync.WaitGroup
 	alive   atomic.Bool
+
+	// handshakeDone flips to true only after initialize + session/new|load
+	// has returned. Until then, session/update notifications are replay or
+	// init noise (Hermes replays the whole prior conversation on
+	// session/load); they update internal caches but must NOT be pushed to
+	// the bounded events channel, because the engine only starts draining
+	// Events() after StartSession returns, and a replay larger than the
+	// channel buffer would block the readLoop so the handshake response
+	// could never be read — a self-deadlock.
+	handshakeDone atomic.Bool
 
 	cmd *exec.Cmd
 	tr  *transport
@@ -51,6 +68,19 @@ type acpSession struct {
 	modesMu        sync.RWMutex
 	availableModes []acpModeInfo
 	currentMode    string
+
+	// usageMu guards lastUsage, the most recent context/token snapshot used to
+	// render the reply footer (core.ContextUsageReporter). It is merged from two
+	// ACP sources: usage_update notifications carry the context-window size and
+	// tokens currently in context; the usage block on each session/prompt
+	// response carries the per-turn input/output/total/cache token counts.
+	usageMu   sync.RWMutex
+	lastUsage *core.ContextUsage
+
+	// modelMu guards currentModel, the raw model id announced in the
+	// session/new|load response (models.currentModelId).
+	modelMu      sync.RWMutex
+	currentModel string
 
 	callbacks sessionCallbacks // may be nil (tests, integration harness)
 }
@@ -161,7 +191,16 @@ func newACPSession(ctx context.Context, cfg acpSessionConfig) (*acpSession, erro
 // handshake runs initialize → optional authenticate → session/load or
 // session/new, and caches any modes the server advertises so
 // SetLiveMode / PermissionModes can answer correctly.
-func (s *acpSession) handshake(resumeSessionID string, authMethod string) error {
+func (s *acpSession) handshake(resumeSessionID string, authMethod string) (err error) {
+	// Flip handshakeDone only on success. During the handshake, session/update
+	// notifications are history replay that onNotification must drain without
+	// emitting; once it returns they are live output. A named return lets this
+	// single defer cover every success exit (session/load and session/new).
+	defer func() {
+		if err == nil {
+			s.handshakeDone.Store(true)
+		}
+	}()
 	initParams := map[string]any{
 		"protocolVersion": 1,
 		"clientCapabilities": map[string]any{
@@ -218,6 +257,7 @@ func (s *acpSession) handshake(resumeSessionID string, authMethod string) error 
 			var lr struct {
 				SessionID string         `json:"sessionId"`
 				Modes     *acpModesBlock `json:"modes"`
+				Models    *acpModelBlock `json:"models"`
 			}
 			// Per the ACP spec, LoadSessionResponse carries NO sessionId — the
 			// loaded session is the one we requested. Some non-standard agents may
@@ -229,6 +269,7 @@ func (s *acpSession) handshake(resumeSessionID string, authMethod string) error 
 			loadedID := resumeSessionID
 			if json.Unmarshal(loadRes, &lr) == nil {
 				s.absorbModes(lr.Modes)
+				s.absorbModel(lr.Models)
 				if lr.SessionID != "" {
 					loadedID = lr.SessionID
 				}
@@ -249,6 +290,7 @@ func (s *acpSession) handshake(resumeSessionID string, authMethod string) error 
 	var sn struct {
 		SessionID string         `json:"sessionId"`
 		Modes     *acpModesBlock `json:"modes"`
+		Models    *acpModelBlock `json:"models"`
 	}
 	if err := json.Unmarshal(newRes, &sn); err != nil {
 		return fmt.Errorf("acp: parse session/new: %w", err)
@@ -258,7 +300,26 @@ func (s *acpSession) handshake(resumeSessionID string, authMethod string) error 
 	}
 	s.setACPSessionID(sn.SessionID)
 	s.absorbModes(sn.Modes)
+	s.absorbModel(sn.Models)
 	return nil
+}
+
+// acpModelBlock is the subset of the session/new|load `models` field we need:
+// the agent's current model id (SessionModelState.currentModelId).
+type acpModelBlock struct {
+	CurrentModelID string `json:"currentModelId"`
+}
+
+// absorbModel records the current model id announced on session/new|load.
+func (s *acpSession) absorbModel(block *acpModelBlock) {
+	if block == nil {
+		return
+	}
+	if m := strings.TrimSpace(block.CurrentModelID); m != "" {
+		s.modelMu.Lock()
+		s.currentModel = m
+		s.modelMu.Unlock()
+	}
 }
 
 // absorbModes copies a modes block into the session's cache and fans
@@ -290,6 +351,32 @@ func (s *acpSession) currentACPSessionID() string {
 	s.acpSessMu.RLock()
 	defer s.acpSessMu.RUnlock()
 	return s.acpSessID
+}
+
+var (
+	_ core.ContextUsageReporter      = (*acpSession)(nil)
+	_ interface{ GetModel() string } = (*acpSession)(nil)
+)
+
+// GetContextUsage returns a snapshot of the most recent context/token usage
+// (core.ContextUsageReporter), or nil before the first usage_update / prompt
+// response has been observed.
+func (s *acpSession) GetContextUsage() *core.ContextUsage {
+	s.usageMu.RLock()
+	defer s.usageMu.RUnlock()
+	if s.lastUsage == nil {
+		return nil
+	}
+	clone := *s.lastUsage
+	return &clone
+}
+
+// GetModel returns the raw model id announced on session/new|load
+// (models.currentModelId). Empty when the agent never reported one.
+func (s *acpSession) GetModel() string {
+	s.modelMu.RLock()
+	defer s.modelMu.RUnlock()
+	return s.currentModel
 }
 
 // CurrentMode returns the ACP modeId most recently applied or reported
@@ -383,9 +470,18 @@ func (s *acpSession) onNotification(method string, params json.RawMessage) {
 	}
 	s.cacheToolCallInput(params)
 	s.maybeAbsorbCurrentModeUpdate(params)
+	s.absorbUsageUpdate(params)
 	sid := s.currentACPSessionID()
 	// Debug log to capture raw session/update JSON for troubleshooting vendor compatibility
 	slog.Debug("acp: session/update", "session_id", sid, "params", string(params))
+	if !s.handshakeDone.Load() {
+		// Replay/init notifications that arrive during initialize or
+		// session/load (e.g. Hermes replaying the full history before the
+		// load response). Internal caches above are kept warm, but the
+		// events channel is not drained until StartSession returns, so
+		// emitting here could fill its buffer and deadlock readLoop.
+		return
+	}
 	for _, ev := range mapSessionUpdate(sid, params) {
 		s.emit(ev)
 	}
@@ -424,6 +520,81 @@ func (s *acpSession) maybeAbsorbCurrentModeUpdate(params json.RawMessage) {
 			AvailableModes: available,
 		})
 	}
+}
+
+// absorbUsageUpdate watches session/update notifications for `usage_update`
+// (total context-window size + tokens currently in context) and merges it into
+// lastUsage so GetContextUsage can drive the reply footer. It is safe to run
+// during handshake: Hermes sends one usage_update right after session/new|load.
+func (s *acpSession) absorbUsageUpdate(params json.RawMessage) {
+	var wrap struct {
+		Update json.RawMessage `json:"update"`
+	}
+	if json.Unmarshal(params, &wrap) != nil || len(wrap.Update) == 0 {
+		return
+	}
+	var head struct {
+		SessionUpdate string `json:"sessionUpdate"`
+		Size          int    `json:"size"`
+		Used          int    `json:"used"`
+	}
+	if json.Unmarshal(wrap.Update, &head) != nil || head.SessionUpdate != "usage_update" {
+		return
+	}
+	if head.Size <= 0 && head.Used <= 0 {
+		return
+	}
+	s.usageMu.Lock()
+	if s.lastUsage == nil {
+		s.lastUsage = &core.ContextUsage{}
+	}
+	if head.Size > 0 {
+		s.lastUsage.ContextWindow = head.Size
+	}
+	if head.Used > 0 {
+		s.lastUsage.UsedTokens = head.Used
+	}
+	s.usageMu.Unlock()
+}
+
+// absorbPromptUsage merges the per-turn Usage block carried on a session/prompt
+// response (input/output/total/reasoning/cache token counts) into lastUsage.
+func (s *acpSession) absorbPromptUsage(res json.RawMessage) {
+	var pr struct {
+		Usage *struct {
+			InputTokens       int `json:"inputTokens"`
+			OutputTokens      int `json:"outputTokens"`
+			TotalTokens       int `json:"totalTokens"`
+			ThoughtTokens     int `json:"thoughtTokens"`
+			CachedReadTokens  int `json:"cachedReadTokens"`
+			CachedWriteTokens int `json:"cachedWriteTokens"`
+		} `json:"usage"`
+	}
+	if json.Unmarshal(res, &pr) != nil || pr.Usage == nil {
+		return
+	}
+	u := pr.Usage
+	s.usageMu.Lock()
+	if s.lastUsage == nil {
+		s.lastUsage = &core.ContextUsage{}
+	}
+	s.lastUsage.InputTokens = u.InputTokens
+	s.lastUsage.OutputTokens = u.OutputTokens
+	s.lastUsage.TotalTokens = u.TotalTokens
+	s.lastUsage.ReasoningOutputTokens = u.ThoughtTokens
+	s.lastUsage.CachedInputTokens = u.CachedReadTokens
+	s.lastUsage.CacheCreationInputTokens = u.CachedWriteTokens
+	if s.lastUsage.UsedTokens <= 0 {
+		// OpenAI-style usage (Hermes/opencode): InputTokens is the WHOLE
+		// prompt and cached-read/write tokens are a subset of it, so the
+		// fallback used size is InputTokens alone — adding cached tokens on
+		// top would double-count them. (Anthropic's disjoint input/cache
+		// split does not apply on the ACP path.)
+		if u.InputTokens > 0 {
+			s.lastUsage.UsedTokens = u.InputTokens
+		}
+	}
+	s.usageMu.Unlock()
 }
 
 // cacheToolCallInput extracts and caches rawInput from tool_call and tool_call_update
@@ -632,6 +803,8 @@ func (s *acpSession) Send(prompt string, messageID string, images []core.ImageAt
 		return fmt.Errorf("acp: session/prompt: %w", err)
 	}
 	slog.Debug("acp: session/prompt response", "session_id", sid, "response_len", len(res), "response", string(res))
+	// Merge per-turn token usage (input/output/total/cache) for the reply footer.
+	s.absorbPromptUsage(res)
 
 	// Text was streamed via session/update; engine aggregates EventText.
 	s.emit(core.Event{

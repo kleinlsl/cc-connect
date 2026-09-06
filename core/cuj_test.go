@@ -230,6 +230,7 @@ func newCUJEnv(t *testing.T) *cujEnv {
 	agent := &cujAgent{}
 	storePath := dir + "/sessions.json"
 	e := NewEngine("test", agent, []Platform{plat}, storePath, LangEnglish)
+	t.Cleanup(func() { e.Stop() })
 	return &cujEnv{
 		t:       t,
 		engine:  e,
@@ -639,6 +640,7 @@ func TestCUJ_G1_LLMFailureSurfacesErrorToUser(t *testing.T) {
 	agent.failNext.Set(true)
 	dir := t.TempDir()
 	e := NewEngine("test", agent, []Platform{plat}, dir+"/sessions.json", LangEnglish)
+	t.Cleanup(func() { e.Stop() })
 
 	msg := &Message{
 		SessionKey: "test:fred",
@@ -822,6 +824,7 @@ func TestCUJ_B12_RestartRestoresEverything(t *testing.T) {
 		plat := &stubPlatformEngine{n: "test"}
 		agent := &cujAgent{}
 		e1 := NewEngine("test", agent, []Platform{plat}, storePath, LangEnglish)
+		t.Cleanup(func() { e1.Stop() })
 		store, err := NewCronStore(cronDir)
 		if err != nil {
 			t.Fatalf("NewCronStore: %v", err)
@@ -872,6 +875,7 @@ func TestCUJ_B12_RestartRestoresEverything(t *testing.T) {
 		plat := &stubPlatformEngine{n: "test"}
 		agent := &cujAgent{}
 		e2 := NewEngine("test", agent, []Platform{plat}, storePath, LangEnglish)
+		t.Cleanup(func() { e2.Stop() })
 		store, err := NewCronStore(cronDir)
 		if err != nil {
 			t.Fatalf("run2 NewCronStore: %v", err)
@@ -1024,6 +1028,7 @@ func TestCUJ_G3_PlatformReconnectReinitializesAndDelivers(t *testing.T) {
 	}
 	agent := &cujAgent{}
 	e := NewEngine("test", agent, []Platform{plat}, dir+"/sessions.json", LangEnglish)
+	t.Cleanup(func() { e.Stop() })
 
 	// 1. Initial connect.
 	e.OnPlatformReady(plat)
@@ -1127,6 +1132,7 @@ func TestCUJ_A3_ImageReachesAgent(t *testing.T) {
 	agent := &cujAgent{}
 	dir := t.TempDir()
 	e := NewEngine("test", agent, []Platform{plat}, dir+"/sessions.json", LangEnglish)
+	t.Cleanup(func() { e.Stop() })
 
 	msg := &Message{
 		SessionKey: "test:img", Platform: "test", MessageID: "img1",
@@ -1162,6 +1168,7 @@ func TestCUJ_A4_VoiceMessageWithoutSTTSurfacesClearMessage(t *testing.T) {
 	agent := &cujAgent{}
 	dir := t.TempDir()
 	e := NewEngine("test", agent, []Platform{plat}, dir+"/sessions.json", LangEnglish)
+	t.Cleanup(func() { e.Stop() })
 
 	msg := &Message{
 		SessionKey: "test:voice", Platform: "test", MessageID: "v1",
@@ -1191,6 +1198,7 @@ func TestCUJ_A5_FileReachesAgent(t *testing.T) {
 	agent := &cujAgent{}
 	dir := t.TempDir()
 	e := NewEngine("test", agent, []Platform{plat}, dir+"/sessions.json", LangEnglish)
+	t.Cleanup(func() { e.Stop() })
 
 	msg := &Message{
 		SessionKey: "test:file", Platform: "test", MessageID: "f1",
@@ -1607,6 +1615,7 @@ func TestCUJ_E4_TimerFiresAndDeliversToAgentAndUser(t *testing.T) {
 	plat := &cujReplyCtxPlatform{stubPlatformEngine: &stubPlatformEngine{n: "test"}}
 	agent := &cujAgent{}
 	e := NewEngine("test", agent, []Platform{plat}, dir+"/sessions.json", LangEnglish)
+	t.Cleanup(func() { e.Stop() })
 
 	timerDir := dir + "/timer"
 	if err := os.MkdirAll(timerDir, 0o755); err != nil {
@@ -1965,6 +1974,7 @@ func TestCUJ_H2_TwoPlatformsConcurrentNoBleed(t *testing.T) {
 	pB := &stubPlatformEngine{n: "platB"}
 	agent := &cujAgent{}
 	e := NewEngine("test", agent, []Platform{pA, pB}, dir+"/sessions.json", LangEnglish)
+	t.Cleanup(func() { e.Stop() })
 
 	// Fire 5 messages on each platform concurrently.
 	var wg sync.WaitGroup
@@ -2115,6 +2125,7 @@ func newCUJStreamingEnv(t *testing.T) *cujEnv {
 	agent := &cujAgent{}
 	storePath := dir + "/sessions.json"
 	e := NewEngine("test", agent, []Platform{plat}, storePath, LangEnglish)
+	t.Cleanup(func() { e.Stop() })
 	// env.plat is typed *stubPlatformEngine so that userSends (which
 	// calls plat(env.plat) to bridge into a Platform interface) works.
 	// We point it at the same embedded instance the engine holds, so
@@ -2353,6 +2364,7 @@ func TestCUJ_H4_FeishuTopicsKeepWorkspaceBindingsIsolated(t *testing.T) {
 		filepath.Join(t.TempDir(), "sessions.json"),
 		LangEnglish,
 	)
+	t.Cleanup(func() { engine.Stop() })
 	engine.SetMultiWorkspace(baseDir, filepath.Join(t.TempDir(), "bindings.json"))
 	engine.workspaceBindings.Bind(
 		"project:test",
@@ -2411,4 +2423,120 @@ func TestCUJ_H4_FeishuTopicsKeepWorkspaceBindingsIsolated(t *testing.T) {
 	if got := lastReply(); !strings.Contains(got, normalizeWorkspacePath(workspaceB)) {
 		t.Fatalf("topic B changed after topic A unbind: %q", got)
 	}
+}
+
+// ===========================================================================
+// CUJ-G7 · Outbox redelivery: a final reply produced during a network outage
+// is NOT lost — once connectivity returns the user still sees it, and later
+// replies keep flowing. This locks down the 2026-09 incident where the model
+// had finished but "reply failed after 3 retries" dropped the answer forever.
+//
+// User actions (>=3):
+//  1. user sends while "offline" -> sees nothing yet, reply is durably parked
+//  2. network recovers (no re-prompt) -> the parked answer is redelivered
+//  3. user sends again while online -> immediate reply, outbox drained
+// ===========================================================================
+
+// cujOutboxPlatform opts in to the outbox interfaces and can toggle connectivity.
+type cujOutboxPlatform struct {
+	stubPlatformEngine
+	mu      sync.Mutex
+	offline bool
+}
+
+func (p *cujOutboxPlatform) Send(ctx context.Context, r any, content string) error {
+	p.mu.Lock()
+	off := p.offline
+	p.mu.Unlock()
+	if off {
+		return errors.New("dial tcp 1.2.3.4:443: connect: connection refused")
+	}
+	return p.stubPlatformEngine.Send(ctx, r, content)
+}
+
+func (p *cujOutboxPlatform) Reply(ctx context.Context, r any, content string) error {
+	p.mu.Lock()
+	off := p.offline
+	p.mu.Unlock()
+	if off {
+		return errors.New("dial tcp 1.2.3.4:443: connect: connection refused")
+	}
+	return p.stubPlatformEngine.Reply(ctx, r, content)
+}
+
+func (p *cujOutboxPlatform) EncodeReplyCtx(r any) ([]byte, error) {
+	return []byte(fmt.Sprintf("%v", r)), nil
+}
+func (p *cujOutboxPlatform) DecodeReplyCtx(b []byte) (any, error) { return string(b), nil }
+func (p *cujOutboxPlatform) IsRetryableSendError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "connection refused")
+}
+func (p *cujOutboxPlatform) setOffline(v bool) {
+	p.mu.Lock()
+	p.offline = v
+	p.mu.Unlock()
+}
+
+func TestCUJ_G7_OutboxRedeliversAfterOutage(t *testing.T) {
+	dir := t.TempDir()
+	plat := &cujOutboxPlatform{stubPlatformEngine: stubPlatformEngine{n: "test"}}
+	agent := &cujAgent{}
+	e := NewEngine("test", agent, []Platform{plat}, filepath.Join(dir, "sessions.json"), LangEnglish)
+	t.Cleanup(func() { e.Stop() })
+	e.SetDataDir(dir)
+	e.SetOutboxConfig(OutboxConfig{
+		Enabled: true, MaxAge: 30 * time.Second, MaxAttempts: 10,
+		InitialDelay: 5 * time.Millisecond, MaxDelay: 20 * time.Millisecond, SweepInterval: 20 * time.Millisecond,
+	})
+	if err := e.Start(); err != nil {
+		t.Fatalf("engine start: %v", err)
+	}
+	defer e.Stop()
+
+	send := func(content string) {
+		e.ReceiveMessage(plat, &Message{
+			SessionKey: "test:u1", Platform: "test",
+			MessageID: "msg-" + content, UserID: "u1", UserName: "u1",
+			Content: content, ReplyCtx: "ctx-u1",
+		})
+	}
+	countReplies := func() int {
+		n := 0
+		for _, s := range plat.getSent() {
+			if s == "ok" {
+				n++
+			}
+		}
+		return n
+	}
+	wait := func(what string, cond func() bool) {
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			if cond() {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		t.Fatalf("timed out: %s (sent=%v pending=%d)", what, plat.getSent(), e.outbox.PendingCount())
+	}
+
+	// Action 1: outage when the user sends. The model finishes but the final
+	// reply cannot leave — it must be parked in the outbox, not lost.
+	plat.setOffline(true)
+	send("firstmsg")
+	wait("reply parked during outage", func() bool { return e.outbox.PendingCount() == 1 })
+	if countReplies() != 0 {
+		t.Fatalf("user should see nothing while offline, got %v", plat.getSent())
+	}
+
+	// Action 2: connectivity returns; WITHOUT the user re-asking, the parked
+	// answer is redelivered and the outbox drains.
+	plat.setOffline(false)
+	wait("parked reply redelivered after recovery", func() bool { return countReplies() == 1 })
+	wait("outbox drained after redelivery", func() bool { return e.outbox.PendingCount() == 0 })
+
+	// Action 3: a normal online turn is delivered immediately and leaves nothing parked.
+	send("secondmsg")
+	wait("second reply delivered immediately", func() bool { return countReplies() == 2 })
+	wait("no residue in outbox", func() bool { return e.outbox.PendingCount() == 0 })
 }

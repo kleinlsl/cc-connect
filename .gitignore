@@ -3,6 +3,10 @@
 # ============================================================================
 /cc-connect
 cc-connect.bak-*
+cc-connect-arm64.bak-*
+cc-connect-arm64.prev
+.tmp_patch_*.py
+core/test_ws_*.json
 *.exe
 *.exe~
 *.dll

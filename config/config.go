@@ -107,6 +107,7 @@ type Config struct {
 	Relay              RelayConfig             `toml:"relay"`               // bot-to-bot relay behavior
 	Cron               CronConfig              `toml:"cron"`
 	Queue              QueueConfig             `toml:"queue"`
+	Outbox             OutboxConfig            `toml:"outbox"` // durable redelivery of failed final replies
 	Webhook            WebhookConfig           `toml:"webhook"`
 	Bridge             BridgeConfig            `toml:"bridge"`
 	Management         ManagementConfig        `toml:"management"`
@@ -145,6 +146,18 @@ type CronConfig struct {
 // QueueConfig controls the per-session message queue.
 type QueueConfig struct {
 	MaxDepth *int `toml:"max_depth"` // max queued messages per session; default 5
+}
+
+// OutboxConfig controls durable redelivery of final replies whose immediate
+// send failed on a retryable network/platform error (e.g. a few-minute outage
+// of the connection to the messaging API, or a restart mid-send). Failed final
+// replies are persisted under <data_dir>/outbox and resent with exponential
+// backoff once connectivity returns. Only final replies are redelivered;
+// progress/thinking side-channel messages are not.
+type OutboxConfig struct {
+	Enabled     *bool `toml:"enabled"`      // default true
+	MaxAgeMins  *int  `toml:"max_age_mins"` // drop unsent replies older than N minutes; default 30
+	MaxAttempts *int  `toml:"max_attempts"` // max send attempts per reply; default 12
 }
 
 // WebhookConfig controls the external HTTP webhook endpoint.

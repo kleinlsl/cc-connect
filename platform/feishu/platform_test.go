@@ -1228,7 +1228,7 @@ func TestBuildReplyMessageReqBody_SetsReplyInThreadFlag(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			body := tt.platform.buildReplyMessageReqBody(tt.replyCtx, larkim.MsgTypeText, `{"text":"hello"}`)
+			body := tt.platform.buildReplyMessageReqBody(tt.replyCtx, larkim.MsgTypeText, `{"text":"hello"}`, "")
 			if body == nil {
 				t.Fatal("Body = nil, want populated reply body")
 			}
@@ -2783,5 +2783,18 @@ func TestInteractivePlatform_CardActionP2PAllowedViaAllowP2PFrom(t *testing.T) {
 		t.Fatalf("unlisted card action should have been dropped, got %q", got)
 	default:
 		// expected: no nav handler invocation
+	}
+}
+
+func TestBuildReplyBodyUUID(t *testing.T) {
+	p := &Platform{}
+	rc := replyContext{messageID: "om_x"}
+	none := p.buildReplyMessageReqBody(rc, larkim.MsgTypeText, `{"text":"a"}`, "")
+	if none.Uuid != nil {
+		t.Fatalf("empty uuid must leave Uuid nil, got %v", *none.Uuid)
+	}
+	with := p.buildReplyMessageReqBody(rc, larkim.MsgTypeText, `{"text":"b"}`, "idem-1")
+	if with.Uuid == nil || *with.Uuid != "idem-1" {
+		t.Fatalf("uuid not propagated into reply body: %+v", with.Uuid)
 	}
 }

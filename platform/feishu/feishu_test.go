@@ -2566,3 +2566,30 @@ func TestAckSessionFooter(t *testing.T) {
 		t.Fatalf("fresh-topic ack footer must be empty, got %q", got)
 	}
 }
+
+func TestAckFooter_ShowSessionKeySwitch(t *testing.T) {
+	realKey := "feishu:oc_123:thread:omt_real_topic"
+	tempKey := "feishu:oc_123:thread:om_trigger_msg"
+	triggerMsg := "om_trigger_msg"
+
+	t.Run("enabled shows real key (default)", func(t *testing.T) {
+		p := &Platform{ackShowSessionKey: true}
+		want := "\n[session: " + realKey + "]"
+		if got := p.ackFooter(realKey, triggerMsg); got != want {
+			t.Fatalf("ackFooter = %q, want %q", got, want)
+		}
+		// The fresh-topic temporary-key suppression still applies when enabled.
+		if got := p.ackFooter(tempKey, triggerMsg); got != "" {
+			t.Fatalf("temporary key must stay hidden, got %q", got)
+		}
+	})
+
+	t.Run("disabled hides every key", func(t *testing.T) {
+		p := &Platform{ackShowSessionKey: false}
+		for _, key := range []string{realKey, tempKey, "feishu:ou_1:ou_1", ""} {
+			if got := p.ackFooter(key, triggerMsg); got != "" {
+				t.Fatalf("ackFooter(%q) = %q, want empty when switch is off", key, got)
+			}
+		}
+	})
+}

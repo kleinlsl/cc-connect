@@ -119,6 +119,57 @@ type replyResult struct {
 	threadID  string
 }
 
+// replyContextDTO is the JSON-serializable form of replyContext used for the
+// core outbox (replyContext's fields are unexported, so it can't be marshaled
+// directly).
+type replyContextDTO struct {
+	MessageID       string `json:"message_id"`
+	ChatID          string `json:"chat_id"`
+	SessionKey      string `json:"session_key"`
+	ThreadID        string `json:"thread_id"`
+	ReplyInThread   bool   `json:"reply_in_thread"`
+	BootstrapThread bool   `json:"bootstrap_thread"`
+}
+
+// EncodeReplyCtx implements core.ReplyContextCodec for durable redelivery.
+func (p *Platform) EncodeReplyCtx(rctx any) ([]byte, error) {
+	rc, ok := rctx.(replyContext)
+	if !ok {
+		return nil, fmt.Errorf("%s: cannot encode reply context of type %T", p.tag(), rctx)
+	}
+	return json.Marshal(replyContextDTO{
+		MessageID:       rc.messageID,
+		ChatID:          rc.chatID,
+		SessionKey:      rc.sessionKey,
+		ThreadID:        rc.threadID,
+		ReplyInThread:   rc.replyInThread,
+		BootstrapThread: rc.bootstrapThread,
+	})
+}
+
+// DecodeReplyCtx implements core.ReplyContextCodec.
+func (p *Platform) DecodeReplyCtx(b []byte) (any, error) {
+	var d replyContextDTO
+	if err := json.Unmarshal(b, &d); err != nil {
+		return nil, fmt.Errorf("%s: decode reply context: %w", p.tag(), err)
+	}
+	return replyContext{
+		messageID:       d.MessageID,
+		chatID:          d.ChatID,
+		sessionKey:      d.SessionKey,
+		threadID:        d.ThreadID,
+		replyInThread:   d.ReplyInThread,
+		bootstrapThread: d.BootstrapThread,
+	}, nil
+}
+
+// IsRetryableSendError implements core.SendErrorClassifier. Only transient
+// network/transport failures warrant durable redelivery; permanent API errors
+// (e.g. bot removed from chat, invalid params, missing permission) do not.
+func (p *Platform) IsRetryableSendError(err error) bool {
+	return isTransientError(err)
+}
+
 type Platform struct {
 	mu                         sync.RWMutex
 	platformName               string
@@ -146,6 +197,9 @@ type Platform struct {
 	// does not have to jump out to the original (often off-topic) message.
 	echoQuotedInThread    bool
 	groupChatHistoryShare bool
+	// ackShowSessionKey: when true (default), ack messages carry a "[session: ..]"
+	// footer; set ack_show_session_key=false to hide it.
+	ackShowSessionKey bool
 	// noReplyToTrigger: when true, send via Create instead of Im.Message.Reply (no quote to the user's message).
 	noReplyToTrigger bool
 	resolveMentions  bool
@@ -395,6 +449,12 @@ func newPlatform(name, domain string, opts map[string]any) (core.Platform, error
 	cardRequiresMention, _ := opts["card_requires_mention"].(bool)
 	echoQuotedInThread, _ := opts["echo_quoted_in_thread"].(bool)
 	groupChatHistoryShare, _ := opts["group_chat_history_share"].(bool)
+	// The "[session: ..]" ack footer is shown by default; only an explicit
+	// ack_show_session_key=false turns it off.
+	ackShowSessionKey := true
+	if v, ok := opts["ack_show_session_key"].(bool); ok {
+		ackShowSessionKey = v
+	}
 	resolveMentionsOpt, _ := opts["resolve_mentions"].(bool)
 	noReplyToTrigger := false
 	if v, ok := opts["reply_to_trigger"].(bool); ok && !v {
@@ -524,6 +584,7 @@ func newPlatform(name, domain string, opts map[string]any) (core.Platform, error
 		cardRequiresMention:        cardRequiresMention,
 		echoQuotedInThread:         echoQuotedInThread,
 		groupChatHistoryShare:      groupChatHistoryShare,
+		ackShowSessionKey:          ackShowSessionKey,
 		resolveMentions:            resolveMentionsOpt,
 		noReplyToTrigger:           noReplyToTrigger,
 		sessionKeyStrategy:         sessionKeyStrategy,
@@ -1330,7 +1391,7 @@ func (p *Platform) sendAckMessage(msg *core.Message) {
 		return
 	}
 	ackText := p.buildAckText(msg.Content)
-	ackTextWithKey := fmt.Sprintf("%s\n[session: %s]", ackText, msg.SessionKey)
+	ackTextWithKey := ackText + p.ackFooter(msg.SessionKey, "")
 	if err := p.Send(context.Background(), msg.ReplyCtx, ackTextWithKey); err != nil {
 		slog.Debug(p.tag()+": send ack failed", "error", err, "session_key", msg.SessionKey)
 		return
@@ -1352,7 +1413,7 @@ func (p *Platform) sendAckAndGetThreadID(ctx context.Context, content string, rc
 	// cannot edit a plain-text ack (error 230001 "This message is NOT a card"). So
 	// suppress the [session:] footer on that fresh-topic ack; on follow-ups inside
 	// an existing topic the key already is the real omt_ id and the footer is shown.
-	ackTextWithKey := ackText + ackSessionFooter(rctx.sessionKey, rctx.messageID)
+	ackTextWithKey := ackText + p.ackFooter(rctx.sessionKey, rctx.messageID)
 	msgType, msgBody := buildReplyContent(ackTextWithKey)
 	result, err := p.replyMessage(ctx, rctx, msgType, msgBody)
 	if err != nil {
@@ -1377,6 +1438,16 @@ func ackSessionFooter(sessionKey, triggerMessageID string) string {
 		return ""
 	}
 	return fmt.Sprintf("\n[session: %s]", sessionKey)
+}
+
+// ackFooter wraps ackSessionFooter with the ack_show_session_key switch. When
+// the footer is disabled it returns "" regardless of the session key, so acks
+// read as plain text and no internal session identifier is exposed to the chat.
+func (p *Platform) ackFooter(sessionKey, triggerMessageID string) string {
+	if !p.ackShowSessionKey {
+		return ""
+	}
+	return ackSessionFooter(sessionKey, triggerMessageID)
 }
 
 // quotedEchoMaxRunes caps how much quoted parent text is echoed into a freshly
@@ -4413,10 +4484,13 @@ func (p *Platform) sendNewMessageToChat(ctx context.Context, rc replyContext, ms
 	return p.createMessage(ctx, rc.chatID, msgType, content, "send")
 }
 
-func (p *Platform) buildReplyMessageReqBody(rc replyContext, msgType, content string) *larkim.ReplyMessageReqBody {
+func (p *Platform) buildReplyMessageReqBody(rc replyContext, msgType, content, uuid string) *larkim.ReplyMessageReqBody {
 	body := larkim.NewReplyMessageReqBodyBuilder().
 		MsgType(msgType).
 		Content(content)
+	if uuid != "" {
+		body.Uuid(uuid)
+	}
 	if p.shouldReplyInThread(rc) {
 		body.ReplyInThread(true)
 	}
@@ -4428,7 +4502,7 @@ func (p *Platform) buildReplyMessageReqBody(rc replyContext, msgType, content st
 func (p *Platform) replyMessage(ctx context.Context, rc replyContext, msgType, content string) (replyResult, error) {
 	req := larkim.NewReplyMessageReqBuilder().
 		MessageId(rc.messageID).
-		Body(p.buildReplyMessageReqBody(rc, msgType, content)).
+		Body(p.buildReplyMessageReqBody(rc, msgType, content, core.OutboxUUIDFromContext(ctx))).
 		Build()
 	var result replyResult
 	err := p.withTransientRetry(ctx, "reply", func() error {
@@ -4453,13 +4527,16 @@ func (p *Platform) replyMessage(ctx context.Context, rc replyContext, msgType, c
 }
 
 func (p *Platform) createMessage(ctx context.Context, chatID, msgType, content, op string) error {
+	createBody := larkim.NewCreateMessageReqBodyBuilder().
+		ReceiveId(chatID).
+		MsgType(msgType).
+		Content(content)
+	if u := core.OutboxUUIDFromContext(ctx); u != "" {
+		createBody.Uuid(u)
+	}
 	req := larkim.NewCreateMessageReqBuilder().
 		ReceiveIdType(larkim.ReceiveIdTypeChatId).
-		Body(larkim.NewCreateMessageReqBodyBuilder().
-			ReceiveId(chatID).
-			MsgType(msgType).
-			Content(content).
-			Build()).
+		Body(createBody.Build()).
 		Build()
 	return p.withTransientRetry(ctx, op, func() error {
 		return p.withFreshTenantAccessTokenRetry(ctx, op, func(client *lark.Client, options ...larkcore.RequestOptionFunc) error {
@@ -4537,9 +4614,12 @@ func isTenantAccessTokenInvalid(err error) bool {
 // const) so tests can shrink the retry window; production callers never
 // touch them after init.
 var (
-	maxTransientRetries    = 3
+	// Synchronous in-request retry window. These defaults cover short blips
+	// (~1 minute total: 0.5s→1s→2s→4s→8s→16s→30s cap); longer outages and
+	// process restarts are covered by the core outbox redelivery layer.
+	maxTransientRetries    = 6
 	transientRetryInitial  = 500 * time.Millisecond
-	transientRetryMaxDelay = 5 * time.Second
+	transientRetryMaxDelay = 30 * time.Second
 )
 
 // isTransientError returns true if the error is a transient network error
@@ -5499,7 +5579,7 @@ func (p *Platform) SendPreviewStart(ctx context.Context, rctx any, content strin
 	if p.shouldUseThreadOrReplyAPI(rc) {
 		req := larkim.NewReplyMessageReqBuilder().
 			MessageId(rc.messageID).
-			Body(p.buildReplyMessageReqBody(rc, larkim.MsgTypeInteractive, sendContent)).
+			Body(p.buildReplyMessageReqBody(rc, larkim.MsgTypeInteractive, sendContent, core.OutboxUUIDFromContext(ctx))).
 			Build()
 		var resp *larkim.ReplyMessageResp
 		if err := p.withTransientRetry(ctx, "send preview", func() error {

@@ -340,6 +340,23 @@ level = "info" # debug, info, warn, error
 #                            # 定时任务默认会话模式："reuse"（复用活跃会话）或 "new_per_run"（每次新建会话）
 
 # =============================================================================
+# Outbox (durable redelivery) / 出站消息发件箱（失败补发）
+# =============================================================================
+# When a FINAL reply can't be delivered because of a transient network/platform
+# error (connection refused, timeout, reset, 5xx ...), it is persisted under
+# <data_dir>/outbox and resent with exponential backoff once connectivity
+# returns — including after a process restart. Only final replies are retried;
+# progress/thinking messages are not. Enabled by default; no config required.
+# 当「最终回复」因瞬时网络/平台错误（连接被拒、超时、连接重置、5xx 等）发不出去时，
+# 会落盘到 <data_dir>/outbox，网络恢复（或进程重启）后按指数退避自动补发。
+# 只补最终回复，过程/思考消息不补。默认开启，通常无需配置。
+#
+# [outbox]
+# enabled = true        # Toggle durable redelivery (default: true) / 是否启用失败补发（默认 true）
+# max_age_mins = 30     # Drop unsent replies older than N minutes (default: 30) / 超过 N 分钟仍未发出则丢弃（默认 30）
+# max_attempts = 12     # Max send attempts per reply (default: 12) / 每条回复最多尝试发送次数（默认 12）
+
+# =============================================================================
 # Webhook / 外部 Webhook 端点
 # =============================================================================
 # Exposes an HTTP endpoint for external systems (git hooks, CI/CD, file watchers)
@@ -1034,6 +1051,8 @@ app_secret = "your-feishu-app-secret"
 #                               # thread 策略下，引用消息触发新话题时，把被引用原文在话题内回显一次，方便在话题内直接对照（默认 false）
 # card_requires_mention = false # By default interactive (card) messages in a group are handled without @mention. Set true to require @mention for cards too (everything then needs an @mention)
 #                               # 默认群里的卡片(interactive)消息无需 @ 即处理；设为 true 后卡片也必须 @机器人（即一切消息都要 @）
+# ack_show_session_key = true   # Whether the ack message carries a "[session: ..]" footer (default true). Set false to hide the internal session key from the chat.
+#                               # ack「收到，正在处理中...」是否附带「[session: ..]」会话标识（默认 true 显示）；设为 false 则不显示该标识
 # Share non-mentioned group messages as context with the next bot-triggered turn.
 # Messages themselves do not trigger a reply.
 # group_chat_history_share = false
@@ -2089,6 +2108,34 @@ app_secret = "your-feishu-app-secret"
 # args = ["--acp", "--stdio"]
 # display_name = "Copilot ACP"
 # # cmd = "/absolute/path/to/copilot"   # if not on PATH (see COPILOT_CLI_PATH in GitHub docs)
+
+# --- Example: Hermes Agent (ACP) ---
+# Hermes accepts headless slash commands over a normal session/prompt.
+# Its context-compression command is `/compress` (NOT `/compact`); set
+# compress_command so cc-connect's /compact forwards to it. Likewise, Hermes
+# switches the running session's model with `/model`; set model_command so
+# cc-connect's /model forwards to it (in-place switch, history preserved).
+# Leave either unset for ACP servers without such a command.
+# Hermes 在普通 session/prompt 通道里支持无头斜杠命令；其上下文压缩命令是
+# `/compress`（注意不是 `/compact`），配置 compress_command 后 cc-connect 的
+# /compact 会转发为该命令；Hermes 用 `/model` 切换当前会话模型，配置
+# model_command 后 cc-connect 的 /model 会转发（当场切换、保留历史）。不支持对应
+# 能力的 ACP server 留空即可（相应命令会提示不支持）。
+#
+# [[projects]]
+# name = "hermes"
+#
+# [projects.agent]
+# type = "acp"
+#
+# [projects.agent.options]
+# work_dir = "/path/to/project"
+# cmd = "hermes"
+# args = ["acp"]                       # add "-p", "<profile>" to select a Hermes profile
+# mode = "dont_ask"
+# display_name = "Hermes"
+# compress_command = "/compress"       # native command used by cc-connect's /compact
+# model_command = "/model"             # native command used by cc-connect's /model (in-place switch)
 
 # [[projects.platforms]]
 # type = "telegram"
